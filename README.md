@@ -447,3 +447,144 @@ This code repository is released under [the MIT License](LICENSE).
       howpublished = {\url{https://github.com/deepseek-ai/DeepEP}},
 }
 ```
+
+## Editable installation from this repository (CUDA 12.9)
+
+Use an editable installation when developing DeepEP so that Python and JIT kernel changes in this checkout are used directly by the installed package. The following workflow was verified with Python 3.12, PyTorch built for CUDA 12.9, an NVIDIA H20 (SM90), NCCL 2.30.4, and NVSHMEM 3.4.5.
+
+### 1. Activate the Conda environment and initialize submodules
+
+```bash
+conda activate <environment-name>
+git submodule update --init --recursive
+```
+
+Activating the Conda environment is sufficient; do not additionally activate a Python `venv`.
+
+### 2. Select CUDA 12.9
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.9
+export CUDA_PATH="$CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export EP_JIT_NVCC_COMPILER="$CUDA_HOME/bin/nvcc"
+```
+
+Verify that both PyTorch and the extension build use CUDA 12.9:
+
+```bash
+which nvcc
+nvcc --version
+
+python - <<'PY'
+import torch
+from torch.utils.cpp_extension import CUDA_HOME
+
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("Build CUDA_HOME:", CUDA_HOME)
+PY
+```
+
+`setup.py` currently includes CCCL from `/usr/local/cuda/include/cccl`. Ensure that `/usr/local/cuda` points to CUDA 12.9, or change that include path in `setup.py` to `f'{os.environ["CUDA_HOME"]}/include/cccl'`.
+
+### 3. Install matching NCCL and NVSHMEM dependencies
+
+Do not keep both the CUDA 12 and CUDA 13 variants in the same environment because they install into the same Python package namespaces.
+
+```bash
+python -m pip uninstall -y nvidia-nccl-cu12 nvidia-nccl-cu13
+python -m pip install --no-deps --force-reinstall "nvidia-nccl-cu12==2.30.4"
+
+python -m pip uninstall -y nvidia-nvshmem-cu12 nvidia-nvshmem-cu13
+python -m pip install --no-deps --force-reinstall "nvidia-nvshmem-cu12==3.4.5"
+```
+
+If the configured package mirror does not contain these versions, add `--index-url https://pypi.org/simple` to the corresponding installation command.
+
+### 4. Compatibility fix for older Linux userspace headers
+
+Some systems define `SYS_pidfd_open` but not `SYS_pidfd_getfd`, causing `csrc/kernels/backend/symmetric.hpp` to fail to compile. First inspect the architecture and kernel:
+
+```bash
+uname -m
+uname -r
+```
+
+On `x86_64` or `aarch64`, add the following immediately after `#include <sys/syscall.h>` in `csrc/kernels/backend/symmetric.hpp` if `SYS_pidfd_getfd` is undefined:
+
+```cpp
+#ifndef SYS_pidfd_getfd
+#ifdef __NR_pidfd_getfd
+#define SYS_pidfd_getfd __NR_pidfd_getfd
+#elif defined(__x86_64__) || defined(__aarch64__)
+#define SYS_pidfd_getfd 438
+#else
+#error "SYS_pidfd_getfd is unavailable for this architecture"
+#endif
+#endif
+```
+
+The syscall normally requires Linux 5.6 or newer at runtime. On an older kernel, this definition permits compilation, but the hybrid GPU/CPU symmetric-memory path can still fail when it invokes the syscall.
+
+### 5. Install DeepEP in editable mode
+
+Run this command from the repository root:
+
+```bash
+python -m pip install -v --no-build-isolation -e .
+```
+
+`--no-build-isolation` lets the build use PyTorch and the NVIDIA packages from the active Conda environment.
+
+### 6. Verify the installation
+
+```bash
+python -m pip show deep_ep
+
+python - <<'PY'
+import ctypes
+import importlib.metadata as md
+import torch
+import deep_ep
+import deep_ep._C as C
+
+print("Package metadata:", md.version("deep_ep"))
+print("DeepEP version:", deep_ep.__version__)
+print("Python source:", deep_ep.__file__)
+print("Compiled extension:", C.__file__)
+print("SM90 enabled:", C.is_sm90_compiled())
+print("CUDA available:", torch.cuda.is_available())
+print("PyTorch CUDA:", torch.version.cuda)
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+paths = sorted({
+    line.split()[-1]
+    for line in open("/proc/self/maps")
+    if "libnccl.so" in line
+})
+print("Loaded NCCL libraries:", paths)
+
+for path in paths:
+    lib = ctypes.CDLL(path)
+    version = ctypes.c_int()
+    result = lib.ncclGetVersion(ctypes.byref(version))
+    print("NCCL runtime version code:", version.value, "return code:", result)
+PY
+```
+
+The Python source and compiled extension should point into this checkout. The NCCL runtime version code should be at least `23004` (NCCL 2.30.4), with return code `0`.
+
+### Development workflow
+
+- Changes to Python files under `deep_ep/` are picked up after restarting the Python processes.
+- JIT kernel header changes under `deep_ep/include/` are recompiled into a new JIT cache entry after restarting the processes.
+- Changes under `csrc/` require rebuilding the extension:
+
+```bash
+python setup.py build_ext --inplace --force
+```
+
+Restart all Python processes and distributed ranks after rebuilding so they load the new extension.
