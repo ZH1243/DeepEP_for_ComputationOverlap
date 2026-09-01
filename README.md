@@ -452,10 +452,10 @@ This code repository is released under [the MIT License](LICENSE).
 
 Use an editable installation when developing DeepEP so that Python and JIT kernel changes in this checkout are used directly by the installed package. The following workflow was verified with Python 3.12, PyTorch built for CUDA 12.9, an NVIDIA H20 (SM90), NCCL 2.30.4, and NVSHMEM 3.4.5.
 
-### 1. Activate the Conda environment and initialize submodules
 The conda env that I used is the one used for QuACK.
 I clone a new one from the existing one, and apply all the following steps.
 
+### 1. Activate the Conda environment and initialize submodules
 
 ```bash
 conda activate <environment-name>
