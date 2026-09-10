@@ -1,11 +1,12 @@
 NUM_NODES=2
-MASTER_ADDR=28.49.38.169
+MASTER_ADDR=28.59.80.49
 MASTER_PORT=9080
 
 NODE_RANK=1
 
-export NCCL_IB_HCA="mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_8,mlx5_8,mlx5_9"
-export NVSHMEM_HCA_LIST="mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_8:1"
+export NCCL_IB_HCA="mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7,mlx5_bond_8"
+export NVSHMEM_HCA_LIST="mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1"
+export NCCL_CUMEM_ENABLE=0
 
 torchrun \
   --nnodes=${NUM_NODES} \
