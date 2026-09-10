@@ -114,11 +114,11 @@ def run_dispatch(
     recv_topk_idx_buffer = None
     dispatch_previous_event = layout_event
     if args.with_collector:
-        # Join layout into the current stream, then let DeepEP wait on this
-        # stream. This orders both the layout and ready-state initialization
-        # before the producer without ordering the independent collector after it.
+        # Join layout into the current stream. Keep layout_event as DeepEP's
+        # previous event: allocate_on_comm_stream requires one, and the C++
+        # publication path also waits on this compute stream so readiness-state
+        # initialization precedes the producer without waiting for the collector.
         base.wait_if_async(layout_event, args.async_finish)
-        dispatch_previous_event = None
         max_recv_rows = args.num_local_tokens * args.ep
         num_rdma_ranks = args.ep // 8
         num_ranges = (args.deepep_num_sms // 2) * 8 * num_rdma_ranks
