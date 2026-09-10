@@ -364,8 +364,9 @@ class Buffer:
             ready_token_state: `(range_begin, range_end, ready_end)` int32 CUDA tensors. Required when
                 `publish_ready_tokens` is set; each tensor has `config.num_sms / 2 * group_size` entries.
             recv_topk_idx_buffer: optional preallocated routing output. This lets an independent collector start before
-                dispatch; it must have shape `[capacity, num_topk]`, cover the actual received row count, and have the
-                same dtype/device as `topk_idx`. The returned tensor is a view trimmed to the actual row count.
+                asynchronous dispatch completes; it must have shape `[capacity, num_topk]`, cover the actual received
+                row count, and have the same dtype/device as `topk_idx`. The returned tensor is a view trimmed to the
+                actual row count.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the

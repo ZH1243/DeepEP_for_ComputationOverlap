@@ -144,14 +144,16 @@ state = allocate_state(num_ranges=80 * num_rdma_ranks, num_rows=max_recv_rows)
 recv_topk_idx = torch.empty(
     (max_recv_rows, num_topk), dtype=topk_dtype, device="cuda")
 
-# Arrange for the producer to wait on state.initialized. For a collector that
-# starts before dispatch, preallocate the recv_topk_idx output as well.
+# Buffer.dispatch first runs a cooperative metadata-notification kernel and
+# then enqueues the data-dispatch producer. Preallocate recv_topk_idx so the
+# collector can be launched immediately after dispatch returns, without first
+# waiting for producer completion.
+# recv_x, recv_topk_idx_view, ..., dispatch_event = buffer.dispatch(
+#     ..., async_finish=True, publish_ready_tokens=True,
+#     ready_token_state=(state.range_begin, state.range_end, state.ready_end),
+#     recv_topk_idx_buffer=recv_topk_idx)
 run = launch(recv_topk_idx, state, timeout_ms=10000)
-
-# Enqueue the producer on its independent stream without waiting for run.event:
-# buffer.dispatch(..., publish_ready_tokens=True,
-#                 ready_token_state=(state.range_begin, state.range_end, state.ready_end),
-#                 recv_topk_idx_buffer=recv_topk_idx)
+# Only now wait for dispatch_event if final dispatch output is needed.
 # During execution, a custom GPU consumer acquire-loads state.ready_count and
 # reads only committed prefixes. Launch that consumer without a completion wait.
 
@@ -169,8 +171,11 @@ the collector wrapper does not receive or manage those tensors.
 
 For earliest overlap from Python, use `recv_topk_idx_buffer`; without it the v1
 API allocates the routing output internally and the pointer is unavailable
-until dispatch returns. Do not enqueue the collector after
-`dispatch_event.current_stream_wait()` on the same stream. See
+until dispatch returns. Do not launch the persistent collector before
+`Buffer.dispatch`: DeepEP first launches a cooperative metadata-notification
+kernel, and a resident collector can prevent its admission. Launch the collector
+after asynchronous `Buffer.dispatch` returns but before calling
+`dispatch_event.current_stream_wait()`. See
 `run/v1/deepep_v1_internode_dispatch_with_ready_tokens_collector.py` for the
 complete stream ordering.
 

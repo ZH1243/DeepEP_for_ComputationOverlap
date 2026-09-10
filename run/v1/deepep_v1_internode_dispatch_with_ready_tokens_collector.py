@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         "--with-collector",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="start the collector before dispatch and enable receiver-frontier publication",
+        help="run a collector concurrently with the asynchronous data-dispatch kernel",
     )
     parser.add_argument(
         "--collector-timeout-ms",
@@ -130,12 +130,6 @@ def run_dispatch(
             num_rows=max_recv_rows,
             device=token_indices.device,
         )
-        collector_run = launch(
-            recv_topk_idx_buffer,
-            collector_state,
-            timeout_ms=args.collector_timeout_ms,
-        )
-
     (
         recv_x,
         recv_token_indices,
@@ -162,6 +156,17 @@ def run_dispatch(
         ) if collector_state is not None else None,
         recv_topk_idx_buffer=recv_topk_idx_buffer,
     )
+    if collector_state is not None:
+        # Buffer.dispatch performs a cooperative metadata-notification kernel
+        # before enqueueing the data-dispatch producer. A persistent collector
+        # launched before that cooperative kernel can prevent its admission and
+        # deadlock the CPU metadata wait. Launch here, after the asynchronous
+        # producer has been enqueued but before waiting for its completion.
+        collector_run = launch(
+            recv_topk_idx_buffer,
+            collector_state,
+            timeout_ms=args.collector_timeout_ms,
+        )
     base.wait_if_async(dispatch_event, args.async_finish)
     end.record()
     torch.cuda.synchronize()
