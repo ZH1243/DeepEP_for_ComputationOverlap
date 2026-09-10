@@ -455,6 +455,8 @@ Use an editable installation when developing DeepEP so that Python and JIT kerne
 The conda env that I used is the one used for QuACK.
 I clone a new one from the existing one, and apply all the following steps.
 
+Currently, I have only tested the DeepEP v1.
+
 ### 1. Activate the Conda environment and initialize submodules
 
 ```bash
@@ -505,6 +507,61 @@ python -m pip install --no-deps --force-reinstall "nvidia-nvshmem-cu12==3.4.5"
 ```
 
 If the configured package mirror does not contain these versions, add `--index-url https://pypi.org/simple` to the corresponding installation command.
+
+### 3.1 Problems with the wheel nvidia-nvshmem-cu12
+But there are some problems when we build the deepep against the wheel `nvidia-nvshmem-cu12` downloaded through pip. 
+
+The biggest problem is that the deepep dispatch test can only achieve around 24GB/s RDMA bandwidth, only half of the NIC bandwidth. The NVlink forwarding part is just fine. I also tried to run the sole nvshmem test for RDMA, and it can only acheieve 24GB/s. 
+This does not happen for the `/usr/local/nvshmem` and also the 'old' deepep package that is built againt it. 
+
+The second problem is in the dispatch test, when we use `_DEEPEP_BUFFER = Buffer(group, num_nvl_bytes,num_rdma_bytes)`, there would be some kind of IPC registration error. So I need to use `_DEEPEP_BUFFER = Buffer(group, num_nvl_bytes,num_rdma_bytes,allow_nvlink_for_low_latency_mode=False)` to remove this error. Although this theoretically does not influence the inter-node normal high-throughput case, but it's strange. 
+
+
+Currently don't know the reasons for the two problems above. 
+
+To solve the nvshmem problem, the current method that I use is to build the deepep against '/usr/local/nvshmem'. To do so:
+```bash
+export EP_NVSHMEM_ROOT_DIR=/usr/local/nvshmem
+export NVSHMEM_DIR=/usr/local/nvshmem
+export TORCH_CUDA_ARCH_LIST=9.0
+```
+and remove the pip nvshmem packages:
+```bash
+python -m pip uninstall -y nvidia-nvshmem-cu12 nvidia-nvshmem-cu13
+```
+
+Before building, verify that the system installation has the layout DeepEP expects:
+```bash
+test -f /usr/local/nvshmem/include/nvshmem.h
+test -f /usr/local/nvshmem/include/device_host_transport/nvshmem_common_ibgda.h
+test -f /usr/local/nvshmem/include/non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh
+
+find /usr/local/nvshmem/lib -maxdepth 1 \
+  \( -name 'libnvshmem_host.so*' -o -name 'libnvshmem_device.a' \) -print
+
+/usr/local/nvshmem/bin/nvshmem-info -a
+```
+Both of these library components are required:
+```bash
+/usr/local/nvshmem/lib/libnvshmem_host.so*
+/usr/local/nvshmem/lib/libnvshmem_device.a
+```
+
+### 3.2 Problems with the installed nccl wheel
+This problem occurs:
+```bash
+[rank7]: torch.distributed.DistBackendError: NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, unhandled system error (run with NCCL_DEBUG=INFO for details), NCCL version 2.30.4
+[rank7]: ncclSystemError: System call (e.g. socket, malloc) or external library call failed or device error. 
+[rank7]: Last error:
+[rank7]: Call to ibv_reg_mr_iova2 failed with error Bad address
+```
+It should relate to the NCCL version and API compatability with CUDA. The current solution is to set:
+```bash
+export NCCL_CUMEM_ENABLE=0
+```
+This should have on influence on the DeepEP performance.
+
+
 
 ### 4. Compatibility fix for older Linux userspace headers
 
@@ -579,6 +636,15 @@ PY
 ```
 
 The Python source and compiled extension should point into this checkout. The NCCL runtime version code should be at least `23004` (NCCL 2.30.4), with return code `0`.
+
+Also verify which NVSHMEM library the extension resolves:
+```bash
+EXTENSION="$(python -c 'import deep_ep._C as C; print(C.__file__)')"
+
+ldd "$EXTENSION" | grep nvshmem
+readelf -d "$EXTENSION" | grep -E 'NEEDED|RUNPATH'
+```
+The resolved host library should come from /usr/local/nvshmem/lib, not the Conda environment.
 
 ### Development workflow
 
