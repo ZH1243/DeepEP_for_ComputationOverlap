@@ -1,6 +1,6 @@
 # Direct DeepEP V1 Dispatch/Combine Tests
 
-This directory contains two standalone tests that call the DeepEP V1 `Buffer`
+This directory contains standalone tests that call the DeepEP V1 `Buffer`
 API directly. They do not import Megatron-LM, do not run a router, and do not
 run expert computation. Instead, they fake local token tensors and top-k router
 decisions so the communication path can be profiled in isolation.
@@ -10,11 +10,16 @@ decisions so the communication path can be profiled in isolation.
 - `deepep_v1_dispatch.py`: benchmarks DeepEP V1 dispatch only.
 - `deepep_v1_combine.py`: runs one setup dispatch to obtain the DeepEP handle,
   then benchmarks DeepEP V1 combine only.
+- `deepep_v1_internode_dispatch_with_ready_tokens_collector.py`: compares the
+  ordinary internode path with the opt-in live ready-token collector path.
 
-The scripts support both cases:
+The original dispatch/combine scripts support both cases:
 
 - Intra-node EP: `--ep <= 8`
 - Inter-node EP: `--ep > 8`
+
+The ready-token collector test accepts only multi-node internode runs and
+requires exactly eight local experts per GPU.
 
 DeepEP chooses the corresponding communication path through its V1 buffer
 configuration and runtime. Expert tensor parallelism is assumed to be 1.
@@ -67,6 +72,28 @@ torchrun \
 ```
 
 Use the same launch shape for `deepep_v1_combine.py`.
+
+Ready-token collector test (requires exactly eight local experts per GPU):
+
+```bash
+torchrun \
+  --nnodes=2 \
+  --node_rank=${NODE_RANK} \
+  --nproc_per_node=8 \
+  --master_addr=${MASTER_ADDR} \
+  --master_port=${MASTER_PORT} \
+  deepep_v1_internode_dispatch_with_ready_tokens_collector.py \
+  --num-local-tokens 4096 \
+  --token-hidden 7168 \
+  --num-of-experts 128 \
+  --topk 8 \
+  --ep 16 \
+  --deepep-num-sms 24 \
+  --with-collector
+```
+
+Omit `--with-collector` to run the same script through the original,
+non-publishing dispatch specialization.
 
 If `--ep` is smaller than `WORLD_SIZE`, the scripts create independent
 contiguous EP groups. For example, with `WORLD_SIZE=32` and `--ep 16`, ranks

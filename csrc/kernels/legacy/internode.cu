@@ -446,6 +446,7 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 template <bool kLowLatencyMode,
           int kNumRDMARanks,
           bool kCachedMode,
+          bool kPublishReadyTokens,
           int kNumTMABytesPerWarp,
           int kNumDispatchRDMASenderWarps,
           int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
@@ -467,6 +468,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
              const int* recv_rdma_rank_prefix_sum,
              const int* gbl_channel_prefix_matrix,
              const int* recv_gbl_rank_prefix_sum,
+             int* ready_range_begin,
+             int* ready_range_end,
+             int* ready_end,
              const bool* is_token_in_rank,
              int num_tokens,
              int num_worst_tokens,
@@ -1095,6 +1099,20 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                 trap();
             }
         }
+
+        // Each receiver warp owns one range per source RDMA rank. Publish the
+        // immutable descriptor before making its initial (possibly empty)
+        // frontier visible to a concurrently running collector.
+        if constexpr (kPublishReadyTokens) {
+            if (lane_id < kNumRDMARanks) {
+                const int range =
+                    (channel_id * LEGACY_NUM_MAX_NVL_PEERS + src_nvl_rank) * kNumRDMARanks + lane_id;
+                ready_range_begin[range] = total_offset;
+                ready_range_end[range] = total_offset + end_offset - start_offset;
+                asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;"
+                             :: "l"(ready_end + range), "r"(total_offset) : "memory");
+            }
+        }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
 
         // Save for combine usage
@@ -1187,6 +1205,18 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                 // Wait TMA to be finished
                 tma_store_wait<0>();
                 __syncwarp();
+
+                // The release is deliberately after both the TMA completion
+                // and the warp synchronization carrying the routing stores.
+                // Only the lane owning this source-RDMA range publishes.
+                if constexpr (kPublishReadyTokens) {
+                    if (lane_id == meta.src_rdma_rank) {
+                        const int range =
+                            (channel_id * LEGACY_NUM_MAX_NVL_PEERS + src_nvl_rank) * kNumRDMARanks + lane_id;
+                        asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;"
+                                     :: "l"(ready_end + range), "r"(total_offset) : "memory");
+                    }
+                }
             }
 
             // Move queue
@@ -1229,6 +1259,9 @@ void dispatch(void* recv_x,
               const int* recv_rdma_rank_prefix_sum,
               const int* gbl_channel_prefix_matrix,
               const int* recv_gbl_rank_prefix_sum,
+              int* ready_range_begin,
+              int* ready_range_end,
+              int* ready_end,
               const bool* is_token_in_rank,
               int num_tokens,
               int num_worst_tokens,
@@ -1247,6 +1280,7 @@ void dispatch(void* recv_x,
               int rank,
               int num_ranks,
               bool is_cached_dispatch,
+              bool publish_ready_tokens,
               cudaStream_t stream,
               int num_channels,
               bool low_latency_mode) {
@@ -1259,11 +1293,17 @@ void dispatch(void* recv_x,
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                   \
     {                                                                                                                          \
-        auto dispatch_func = low_latency_mode                                                                                  \
-            ? (is_cached_dispatch ? dispatch<true, num_rdma_ranks, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>     \
-                                  : dispatch<true, num_rdma_ranks, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>)   \
-            : (is_cached_dispatch ? dispatch<false, num_rdma_ranks, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>    \
-                                  : dispatch<false, num_rdma_ranks, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>); \
+        auto dispatch_func = publish_ready_tokens                                                                             \
+            ? (low_latency_mode                                                                                               \
+                   ? dispatch<true, num_rdma_ranks, false, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>             \
+                   : dispatch<false, num_rdma_ranks, false, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>)           \
+            : (low_latency_mode                                                                                               \
+                   ? (is_cached_dispatch                                                                                      \
+                          ? dispatch<true, num_rdma_ranks, true, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>      \
+                          : dispatch<true, num_rdma_ranks, false, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>)     \
+                   : (is_cached_dispatch                                                                                      \
+                          ? dispatch<false, num_rdma_ranks, true, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>     \
+                          : dispatch<false, num_rdma_ranks, false, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>)); \
         SET_SHARED_MEMORY_FOR_TMA(dispatch_func);                                                                              \
         LAUNCH_KERNEL(&cfg,                                                                                                    \
                       dispatch_func,                                                                                           \
@@ -1284,6 +1324,9 @@ void dispatch(void* recv_x,
                       recv_rdma_rank_prefix_sum,                                                                               \
                       gbl_channel_prefix_matrix,                                                                               \
                       recv_gbl_rank_prefix_sum,                                                                                \
+                      ready_range_begin,                                                                                       \
+                      ready_range_end,                                                                                         \
+                      ready_end,                                                                                               \
                       is_token_in_rank,                                                                                        \
                       num_tokens,                                                                                              \
                       num_worst_tokens,                                                                                        \
@@ -1306,6 +1349,10 @@ void dispatch(void* recv_x,
 
     EP_HOST_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_HOST_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
+    EP_HOST_ASSERT(publish_ready_tokens == (ready_range_begin != nullptr));
+    EP_HOST_ASSERT((ready_range_begin != nullptr) == (ready_range_end != nullptr));
+    EP_HOST_ASSERT((ready_range_begin != nullptr) == (ready_end != nullptr));
+    EP_HOST_ASSERT(not publish_ready_tokens or (not is_cached_dispatch and recv_topk_idx != nullptr));
 
     SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM_MAX_NVL_PEERS) * 32, stream);
     SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);

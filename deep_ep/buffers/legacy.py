@@ -327,7 +327,10 @@ class Buffer:
                  expert_alignment: int = 1, num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 allocate_on_comm_stream: bool = False,
+                 publish_ready_tokens: bool = False,
+                 ready_token_state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+                 recv_topk_idx_buffer: Optional[torch.Tensor] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
             Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -357,6 +360,12 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            publish_ready_tokens: publish incremental receiver ranges for an internode ready-token collector.
+            ready_token_state: `(range_begin, range_end, ready_end)` int32 CUDA tensors. Required when
+                `publish_ready_tokens` is set; each tensor has `config.num_sms / 2 * group_size` entries.
+            recv_topk_idx_buffer: optional preallocated routing output. This lets an independent collector start before
+                dispatch; it must have shape `[capacity, num_topk]`, cover the actual received row count, and have the
+                same dtype/device as `topk_idx`. The returned tensor is a view trimmed to the actual row count.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
@@ -379,7 +388,11 @@ class Buffer:
             assert num_worst_tokens == 0, 'Internode dispatch does not support `num_worst_tokens > 0`'
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, config, previous_event,
-                                           async_finish, allocate_on_comm_stream)
+                                           async_finish, allocate_on_comm_stream, publish_ready_tokens, ready_token_state,
+                                           recv_topk_idx_buffer)
+
+        assert not publish_ready_tokens and ready_token_state is None and recv_topk_idx_buffer is None, \
+            'Ready-token publication is supported only by internode dispatch'
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
@@ -462,7 +475,10 @@ class Buffer:
                            topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
                            config: Optional[Config] = None,
                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                           allocate_on_comm_stream: bool = False) -> \
+                           allocate_on_comm_stream: bool = False,
+                           publish_ready_tokens: bool = False,
+                           ready_token_state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+                           recv_topk_idx_buffer: Optional[torch.Tensor] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
             Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -470,6 +486,14 @@ class Buffer:
         Normally, you should not directly call this function.
         """
         assert config is not None
+        if publish_ready_tokens:
+            assert handle is None, 'Ready-token publication does not support cached dispatch'
+            assert ready_token_state is not None and len(ready_token_state) == 3, \
+                'ready_token_state must be (range_begin, range_end, ready_end)'
+        else:
+            assert ready_token_state is None, 'ready_token_state requires publish_ready_tokens=True'
+            assert recv_topk_idx_buffer is None, 'recv_topk_idx_buffer requires publish_ready_tokens=True'
+        range_begin, range_end, ready_end = ready_token_state if ready_token_state is not None else (None, None, None)
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
@@ -484,7 +508,8 @@ class Buffer:
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                expert_alignment, 0, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, 0, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                publish_ready_tokens, range_begin, range_end, ready_end, recv_topk_idx_buffer)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -496,7 +521,8 @@ class Buffer:
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
-                expert_alignment, 0, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, 0, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                publish_ready_tokens, range_begin, range_end, ready_end, recv_topk_idx_buffer)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)

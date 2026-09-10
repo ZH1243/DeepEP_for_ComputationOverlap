@@ -63,10 +63,7 @@ def get_buffer(group: dist.ProcessGroup, hidden_bytes_per_token: int):
     return _DEEPEP_BUFFER
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run DeepEP V1 dispatch directly with fake tokens and router decisions."
-    )
+def add_dispatch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-local-tokens", type=int, required=True)
     parser.add_argument("--token-hidden", type=int, required=True)
     parser.add_argument("--num-of-experts", type=int, required=True)
@@ -91,6 +88,13 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     add_routing_arguments(parser)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run DeepEP V1 dispatch directly with fake tokens and router decisions."
+    )
+    add_dispatch_arguments(parser)
     return parser.parse_args()
 
 

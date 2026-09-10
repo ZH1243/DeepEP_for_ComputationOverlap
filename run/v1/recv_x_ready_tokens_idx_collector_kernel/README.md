@@ -5,12 +5,11 @@ protocol. It launches **one CTA of 256 threads (eight warps)** and builds eight
 local expert index lists as receiver ranges advance. It never reads `recv_x`,
 scales, or weights: its only token input is `recv_topk_idx`.
 
-**The existing DeepEP dispatch kernel does not publish these counters.** This
-directory supplies the collector, producer publication helpers, a PyTorch
-wrapper, and tests. It does not modify DeepEP's dispatch or its benchmark.
-Real dispatch integration requires the receiver changes described below.
-The code targets CUDA 12.9 / Hopper; it has not been compiled or GPU-tested in
-the development environment, which has neither CUDA nor PyTorch.
+The DeepEP v1 internode dispatch kernel now has an opt-in publication path.
+`Buffer.dispatch(..., publish_ready_tokens=True)` accepts the three descriptor
+tensors through `ready_token_state=(range_begin, range_end, ready_end)`. The
+ordinary path selects a separate CUDA template specialization and executes no
+publication branch or store. The code targets CUDA 12.9 / Hopper.
 
 ## Files and operation
 
@@ -34,6 +33,9 @@ writes those entries, synchronizes, and its leader release-stores the new
 committed count. Another CTA barrier protects shared tile reuse. Range groups
 rotate after every tile even when one range has a large backlog. Partial tiles
 are processed immediately. Empty polls use a short `__nanosleep` backoff.
+Polling acquires and progress publications use Hopper's L1 no-allocate cache
+hint, keeping the small synchronization surface in L2 and avoiding L1 cache
+pollution in both the dispatch receiver and the collector.
 
 There are no global atomic increments on expert counts. Shared-memory atomics
 maintain error/activity/completion bookkeeping. List order depends on observed
@@ -86,11 +88,11 @@ use this invocation's buffers. Allocate fresh state for each dispatch.
 Smaller capacity is allowed when justified by known routing counts. Per-expert
 alignment counts are capacities, not actual committed lengths.
 
-## Required DeepEP receiver integration
+## DeepEP receiver integration
 
-Include `collector.cuh` in the modified receiver and thread the three range
-arrays through the dispatch launch and binding. Ensure their initialization
-(`ready_end=-1`) finishes before either kernel starts.
+The integration is implemented in `csrc/kernels/legacy/internode.cu` and
+threaded through the C++ and Python legacy-buffer APIs. Initialization of
+`ready_end=-1` must finish before either kernel starts.
 
 In `csrc/kernels/legacy/internode.cu`, after the receiver obtains its offsets
 and before its token loop, each lane representing an RDMA rank initializes its
@@ -121,12 +123,12 @@ if (lane_id == meta.src_rdma_rank) {
 The helper only performs a GPU-scope release store; it does not wait for TMA.
 The publishing lane may differ from the TMA issuer, which is why the existing
 warp synchronization must stay. Do not publish on the earlier shared-memory
-load barrier or directly from the NVLink ring tail. For cached dispatch, v1 does
-not return new top-k metadata; supply the matching retained routing tensor, and
-keep it alive and immutable, or start with non-cached dispatch only.
+load barrier or directly from the NVLink ring tail. The current API rejects
+publication for cached dispatch because that path does not produce new top-k
+metadata.
 
-Receiver edits in legacy `internode.cu` require rebuilding `deep_ep._C`, even
-with an editable DeepEP installation. This standalone extension builds itself
+These receiver edits require rebuilding `deep_ep._C`, even with an editable
+DeepEP installation. The standalone collector extension builds itself
 separately and does not rebuild DeepEP.
 
 ## PyTorch API and stream ordering
@@ -137,14 +139,19 @@ From `run/v1` (in the existing CUDA 12.9 conda environment):
 from recv_x_ready_tokens_idx_collector_kernel import allocate_state, build, launch
 
 build()  # Compile/load before starting any producer.
-state = allocate_state(num_ranges=80 * num_rdma_ranks, num_rows=num_recv_rows)
+max_recv_rows = num_local_tokens * ep_size
+state = allocate_state(num_ranges=80 * num_rdma_ranks, num_rows=max_recv_rows)
+recv_topk_idx = torch.empty(
+    (max_recv_rows, num_topk), dtype=topk_dtype, device="cuda")
 
-# Arrange for the modified producer to wait on state.initialized, and pass
-# state.range_begin, state.range_end, state.ready_end to it. The producer's
-# recv_topk_idx output must already be allocated so it can be passed here.
+# Arrange for the producer to wait on state.initialized. For a collector that
+# starts before dispatch, preallocate the recv_topk_idx output as well.
 run = launch(recv_topk_idx, state, timeout_ms=10000)
 
-# Enqueue the producer on its independent stream without waiting for run.event.
+# Enqueue the producer on its independent stream without waiting for run.event:
+# buffer.dispatch(..., publish_ready_tokens=True,
+#                 ready_token_state=(state.range_begin, state.range_end, state.ready_end),
+#                 recv_topk_idx_buffer=recv_topk_idx)
 # During execution, a custom GPU consumer acquire-loads state.ready_count and
 # reads only committed prefixes. Launch that consumer without a completion wait.
 
@@ -160,11 +167,12 @@ downstream consumer must also retain/record tensors for their own streams.
 The caller must retain `recv_x`/scales/weights until computation finishes;
 the collector wrapper does not receive or manage those tensors.
 
-For earliest overlap, integrate this launch into the C++ dispatch wrapper once
-buffers exist, just before enqueueing the transfer kernel. The existing v1
-Python dispatch API allocates outputs internally; launching from Python after
-it returns can miss early progress. Do not enqueue the collector after
-`dispatch_event.current_stream_wait()` on the same stream.
+For earliest overlap from Python, use `recv_topk_idx_buffer`; without it the v1
+API allocates the routing output internally and the pointer is unavailable
+until dispatch returns. Do not enqueue the collector after
+`dispatch_event.current_stream_wait()` on the same stream. See
+`run/v1/deepep_v1_internode_dispatch_with_ready_tokens_collector.py` for the
+complete stream ordering.
 
 For already-complete input, ordinary tensor initialization is fine when ordered
 before the collector by an event, as in `test_torch.py`. During overlapping

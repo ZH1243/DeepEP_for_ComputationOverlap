@@ -26,13 +26,15 @@ enum Status : int {
 #ifdef __CUDACC__
 __device__ __forceinline__ int load_acquire(const int* address) {
     int value;
-    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+    asm volatile("ld.acquire.gpu.L1::no_allocate.global.u32 %0, [%1];"
                  : "=r"(value) : "l"(address) : "memory");
     return value;
 }
 
 __device__ __forceinline__ void store_release(int* address, int value) {
-    asm volatile("st.release.gpu.global.s32 [%0], %1;"
+    // Keep this polling/publication metadata out of L1 on Hopper. The release
+    // still orders all preceding payload and routing stores for the acquire.
+    asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;"
                  :: "l"(address), "r"(value) : "memory");
 }
 

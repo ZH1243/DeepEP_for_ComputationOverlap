@@ -891,7 +891,12 @@ public:
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
-                       bool allocate_on_comm_stream) {
+                       bool allocate_on_comm_stream,
+                       bool publish_ready_tokens,
+                       const std::optional<torch::Tensor>& ready_range_begin,
+                       const std::optional<torch::Tensor>& ready_range_end,
+                       const std::optional<torch::Tensor>& ready_end,
+                       const std::optional<torch::Tensor>& recv_topk_idx_buffer) {
         // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
         // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
         // unless we release GIL here.
@@ -912,6 +917,11 @@ public:
             EP_HOST_ASSERT(num_tokens_per_rdma_rank.has_value());
             EP_HOST_ASSERT(num_tokens_per_expert.has_value());
         }
+        EP_HOST_ASSERT(not publish_ready_tokens or not cached_mode);
+        EP_HOST_ASSERT(publish_ready_tokens == ready_range_begin.has_value());
+        EP_HOST_ASSERT(ready_range_begin.has_value() == ready_range_end.has_value());
+        EP_HOST_ASSERT(ready_range_begin.has_value() == ready_end.has_value());
+        EP_HOST_ASSERT(not recv_topk_idx_buffer.has_value() or publish_ready_tokens);
 
         // Type checks
         if (cached_mode) {
@@ -969,6 +979,22 @@ public:
             topk_idx_ptr = topk_idx->data_ptr<topk_idx_t>();
             topk_weights_ptr = topk_weights->data_ptr<float>();
         }
+        if (publish_ready_tokens) {
+            const int num_ready_ranges = num_channels * num_ranks;
+            for (const auto& ready_tensor : {ready_range_begin, ready_range_end, ready_end}) {
+                EP_HOST_ASSERT(ready_tensor->is_cuda() and ready_tensor->scalar_type() == torch::kInt32);
+                EP_HOST_ASSERT(ready_tensor->dim() == 1 and ready_tensor->is_contiguous());
+                EP_HOST_ASSERT(ready_tensor->size(0) == num_ready_ranges);
+                EP_HOST_ASSERT(ready_tensor->get_device() == x.get_device());
+            }
+            EP_HOST_ASSERT(topk_idx.has_value() and num_topk > 0);
+            if (recv_topk_idx_buffer.has_value()) {
+                EP_HOST_ASSERT(recv_topk_idx_buffer->is_cuda() and recv_topk_idx_buffer->is_contiguous());
+                EP_HOST_ASSERT(recv_topk_idx_buffer->scalar_type() == topk_idx->scalar_type());
+                EP_HOST_ASSERT(recv_topk_idx_buffer->dim() == 2 and recv_topk_idx_buffer->size(1) == num_topk);
+                EP_HOST_ASSERT(recv_topk_idx_buffer->get_device() == x.get_device());
+            }
+        }
 
         // FP8 scales checks
         float* x_scales_ptr = nullptr;
@@ -998,6 +1024,10 @@ public:
         } else {
             stream_wait(comm_stream, compute_stream);
         }
+        // The readiness arrays may have just been initialized on the compute
+        // stream while `previous_event` belongs to the layout stream.
+        if (publish_ready_tokens and previous_event.has_value())
+            stream_wait(comm_stream, compute_stream);
 
         // Create handles (only return for non-cached mode)
         int num_recv_tokens = -1, num_rdma_recv_tokens = -1;
@@ -1130,7 +1160,12 @@ public:
         float* recv_topk_weights_ptr = nullptr;
         float* recv_x_scales_ptr = nullptr;
         if (topk_idx.has_value()) {
-            recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
+            if (recv_topk_idx_buffer.has_value()) {
+                EP_HOST_ASSERT(recv_topk_idx_buffer->size(0) >= num_recv_tokens);
+                recv_topk_idx = recv_topk_idx_buffer->narrow(0, 0, num_recv_tokens);
+            } else {
+                recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
+            }
             recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
             recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
@@ -1160,6 +1195,9 @@ public:
                             recv_rdma_rank_prefix_sum.data_ptr<int>(),
                             gbl_channel_prefix_matrix.data_ptr<int>(),
                             recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                            publish_ready_tokens ? ready_range_begin->data_ptr<int>() : nullptr,
+                            publish_ready_tokens ? ready_range_end->data_ptr<int>() : nullptr,
+                            publish_ready_tokens ? ready_end->data_ptr<int>() : nullptr,
                             is_token_in_rank.data_ptr<bool>(),
                             num_tokens,
                             num_worst_tokens,
@@ -1178,6 +1216,7 @@ public:
                             rank,
                             num_ranks,
                             cached_mode,
+                            publish_ready_tokens,
                             comm_stream,
                             num_channels,
                             low_latency_mode);
@@ -1218,6 +1257,9 @@ public:
                 to.has_value() ? to->record_stream(comm_stream) : void();
                 if (allocate_on_comm_stream)
                     to.has_value() ? to->record_stream(compute_stream) : void();
+            }
+            for (auto& to : {ready_range_begin, ready_range_end, ready_end, recv_topk_idx_buffer}) {
+                to.has_value() ? to->record_stream(comm_stream) : void();
             }
         } else {
             stream_wait(compute_stream, comm_stream);
