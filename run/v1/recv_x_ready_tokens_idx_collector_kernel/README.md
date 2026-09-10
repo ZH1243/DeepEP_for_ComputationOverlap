@@ -169,6 +169,11 @@ downstream consumer must also retain/record tensors for their own streams.
 The caller must retain `recv_x`/scales/weights until computation finishes;
 the collector wrapper does not receive or manage those tensors.
 
+Device capability and clock-rate discovery happens in `allocate_state`, before
+the dispatch producer is enqueued. The hot `launch` path receives precomputed
+watchdog cycles and performs no `cudaGetDeviceProperties` call, since that API
+can delay collector submission behind an executing cooperative kernel.
+
 For earliest overlap from Python, use `recv_topk_idx_buffer`; without it the v1
 API allocates the routing output internally and the pointer is unavailable
 until dispatch returns. Do not launch the persistent collector before

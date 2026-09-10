@@ -111,6 +111,7 @@ def run_dispatch(
 
     collector_run = None
     collector_state = None
+    collector_stream = None
     recv_topk_idx_buffer = None
     dispatch_previous_event = layout_event
     if args.with_collector:
@@ -130,6 +131,7 @@ def run_dispatch(
             num_rows=max_recv_rows,
             device=token_indices.device,
         )
+        collector_stream = torch.cuda.Stream(device=token_indices.device)
     (
         recv_x,
         recv_token_indices,
@@ -165,6 +167,7 @@ def run_dispatch(
         collector_run = launch(
             recv_topk_idx_buffer,
             collector_state,
+            stream=collector_stream,
             timeout_ms=args.collector_timeout_ms,
         )
     base.wait_if_async(dispatch_event, args.async_finish)

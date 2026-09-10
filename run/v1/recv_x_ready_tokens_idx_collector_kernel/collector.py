@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,13 @@ def build():
     )
 
 
+@lru_cache(maxsize=None)
+def _device_clock_rate_khz(device_index: int) -> int:
+    """Query once per device, before a dispatch producer is submitted."""
+    with torch.cuda.device(device_index):
+        return int(build().get_device_clock_rate_khz())
+
+
 @dataclass
 class CollectorState:
     range_begin: torch.Tensor
@@ -49,6 +57,7 @@ class CollectorState:
     consumed_end: torch.Tensor
     status: torch.Tensor
     initialized: torch.cuda.Event
+    clock_rate_khz: int
     _launched: bool = False
 
     def tensors(self):
@@ -97,6 +106,10 @@ def allocate_state(
     if device.type != "cuda":
         raise ValueError("state must be allocated on a CUDA device")
     with torch.cuda.device(device):
+        # Query device properties before dispatch is enqueued. On some Hopper
+        # systems cudaGetDeviceProperties can block behind an executing
+        # cooperative kernel, which would delay submission of the collector.
+        clock_rate_khz = _device_clock_rate_khz(torch.cuda.current_device())
         options = dict(dtype=torch.int32, device=device)
         state = CollectorState(
             range_begin=torch.empty(num_ranges, **options),
@@ -107,6 +120,8 @@ def allocate_state(
             consumed_end=torch.full((num_ranges,), -1, **options),
             status=torch.zeros(1, **options),
             initialized=torch.cuda.Event(),
+            # clock_rate is kHz, equivalently cycles per millisecond.
+            clock_rate_khz=clock_rate_khz,
         )
         state.initialized.record()
     return state
@@ -127,6 +142,9 @@ def launch(
     """
     if state._launched:
         raise ValueError("allocate fresh state for each launch; reusing active/stale state is unsafe")
+    if not isinstance(timeout_ms, (int, float)) or not math.isfinite(timeout_ms) or not 0 <= timeout_ms <= 3600000:
+        raise ValueError("timeout_ms must be finite and in [0, 3600000]; zero disables the watchdog")
+    timeout_cycles = int(timeout_ms * state.clock_rate_khz)
     extension = build()
     device = state.ready_end.device
     with torch.cuda.device(device):
@@ -136,7 +154,7 @@ def launch(
             raise ValueError("collector stream and state must be on the same GPU")
         with torch.cuda.stream(stream):
             stream.wait_event(state.initialized)
-            extension.launch(recv_topk_idx, *state.tensors(), timeout_ms)
+            extension.launch(recv_topk_idx, *state.tensors(), timeout_cycles)
             state._launched = True
             for tensor in (recv_topk_idx, *state.tensors()):
                 tensor.record_stream(stream)
