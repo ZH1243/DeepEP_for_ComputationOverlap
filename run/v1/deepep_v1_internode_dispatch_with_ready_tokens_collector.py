@@ -169,7 +169,31 @@ def run_dispatch(
     collector_ok = True
     collector_counts = None
     if collector_run is not None:
-        collector_run.wait()
+        try:
+            collector_run.wait()
+        except RuntimeError as exc:
+            # The device-wide synchronization above has joined both producer
+            # and collector, so it is safe to inspect the final producer state.
+            ready = collector_state.ready_end.cpu()
+            begin = collector_state.range_begin.cpu()
+            final = collector_state.range_end.cpu()
+            initialized = ready >= 0
+            completed = initialized & (ready == final)
+            unresolved = torch.nonzero(~completed).flatten().tolist()
+            samples = []
+            for range_id in unresolved[:8]:
+                if not bool(initialized[range_id]):
+                    samples.append(f"{range_id}:uninitialized")
+                else:
+                    samples.append(
+                        f"{range_id}:[{int(begin[range_id])},{int(ready[range_id])},{int(final[range_id])}]"
+                    )
+            raise RuntimeError(
+                f"{exc}; producer frontiers after device synchronization: "
+                f"initialized={int(initialized.sum())}/{ready.numel()}, "
+                f"completed={int(completed.sum())}/{ready.numel()}, "
+                f"unresolved_sample={samples}"
+            ) from exc
         collector_ok, collector_counts = check_collector_output(recv_token_indices, collector_state)
 
     if torch.is_tensor(num_recv_tokens_per_expert):
