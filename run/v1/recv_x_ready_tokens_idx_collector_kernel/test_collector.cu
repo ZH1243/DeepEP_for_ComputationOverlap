@@ -156,7 +156,7 @@ void check_incremental(int num_topk, unsigned long long timeout) {
     constexpr int ranges = 23;  // Multiple polling groups, including a partial group.
     std::vector<int> bounds(1, 0);
     for (int r = 0; r < ranges; ++r)
-        bounds.push_back(bounds.back() + (r % 7) * 3);  // Empty and uneven ranges.
+        bounds.push_back(bounds.back() + (r % 7) * 19);  // Empty and uneven ranges.
     const int rows = bounds.back();
     DeviceArray<Index> topk(rows * num_topk);
     DeviceArray<int> payload(rows), boundaries(ranges + 1), begin(ranges), end(ranges), ready(ranges);
@@ -221,6 +221,88 @@ void check_incremental(int num_topk, unsigned long long timeout) {
     std::printf("PASS incremental int%zu, topk=%d\n", sizeof(Index) * 8, num_topk);
 }
 
+// All-ready input forces full tiles and repeated range visits independently of
+// producer scheduling. Many empty ranges also exercise the shared-cache tail.
+template <typename Index>
+void check_backlog(int num_topk, int ranges, unsigned long long timeout) {
+    std::vector<int> begins(ranges), ends(ranges);
+    int rows = 0;
+    for (int r = 0; r < ranges; ++r) {
+        begins[r] = rows;
+        rows += ranges > 4096 ? (r >= 4094 ? 35 : 0) : 65 + r % 3;
+        ends[r] = rows;
+    }
+    std::vector<Index> routing(rows * num_topk);
+    for (int row = 0; row < rows; ++row)
+        for (int k = 0; k < num_topk; ++k)
+            routing[row * num_topk + k] = route(row, k);
+    DeviceArray<Index> topk(routing.size());
+    DeviceArray<int> begin(ranges), end(ranges), ready(ranges), consumed(ranges);
+    DeviceArray<int> indices(8 * rows), counts(8), status(1);
+    topk.put(routing);
+    begin.put(begins);
+    end.put(ends);
+    ready.put(ends);
+    consumed.fill_bytes(0xff);
+    counts.fill_bytes(0);
+    status.fill_bytes(0);
+    CUDA_CHECK(recv_x_ready::launch_collector(
+        topk.ptr, std::is_same<Index, int64_t>::value, rows, num_topk,
+        begin.ptr, end.ptr, ready.ptr, ranges, indices.ptr, rows, counts.ptr,
+        consumed.ptr, status.ptr, timeout, nullptr));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK(status.get()[0] == recv_x_ready::kComplete);
+    CHECK(consumed.get() == ends);
+    const auto actual_counts = counts.get();
+    const auto actual_indices = indices.get();
+    for (int e = 0; e < 8; ++e) {
+        std::vector<int> expected;
+        for (int row = 0; row < rows; ++row) {
+            bool matches = false;
+            for (int k = 0; k < num_topk; ++k)
+                matches |= route(row, k) == e;
+            if (matches)
+                expected.push_back(row);
+        }
+        CHECK(actual_counts[e] == static_cast<int>(expected.size()));
+        std::vector<int> actual(actual_indices.begin() + e * rows,
+                                actual_indices.begin() + e * rows + actual_counts[e]);
+        std::sort(actual.begin(), actual.end());
+        CHECK(actual == expected);
+    }
+    std::printf("PASS backlog int%zu, topk=%d, ranges=%d\n", sizeof(Index) * 8, num_topk, ranges);
+}
+
+// Overflow in a later 32-row segment must reject the entire tile before any
+// out-of-capacity write or count publication.
+void check_tile_overflow(unsigned long long timeout) {
+    constexpr int ranges = 8, rows = 128, capacity = 40;
+    DeviceArray<int> topk(rows), begin(ranges), end(ranges), ready(ranges), consumed(ranges);
+    DeviceArray<int> indices(8 * capacity), counts(8), status(1);
+    std::vector<int> begins, ends;
+    for (int r = 0; r < ranges; ++r) {
+        begins.push_back(r * 16);
+        ends.push_back((r + 1) * 16);
+    }
+    topk.fill_bytes(0);
+    begin.put(begins);
+    end.put(ends);
+    ready.put(ends);
+    consumed.fill_bytes(0xff);
+    indices.fill_bytes(0xff);
+    counts.fill_bytes(0);
+    status.fill_bytes(0);
+    CUDA_CHECK(recv_x_ready::launch_collector(
+        topk.ptr, false, rows, 1, begin.ptr, end.ptr, ready.ptr, ranges,
+        indices.ptr, capacity, counts.ptr, consumed.ptr, status.ptr, timeout, nullptr));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK(status.get()[0] == recv_x_ready::kCapacityExceeded);
+    CHECK(consumed.get() == ends);
+    for (int count : counts.get()) CHECK(count == 0);
+    for (int index : indices.get()) CHECK(index == -1);
+    std::puts("PASS multi-segment capacity rejection");
+}
+
 void check_terminal(int begin_value, int end_value, int ready_value,
                     int expert, int capacity, int expected, unsigned long long timeout) {
     DeviceArray<int> topk(2), begin(1), end(1), ready(1), indices(8 * capacity);
@@ -247,11 +329,18 @@ int main() {
     CHECK(properties.major >= 9 && properties.concurrentKernels);
     const auto timeout = static_cast<unsigned long long>(properties.clockRate) * 10000;
     for (int repeat = 0; repeat < 3; ++repeat) {
-        for (const int topk : {1, 8, 32}) {
+        for (const int topk : {1, 2, 3, 4, 8, 16, 31, 32}) {
             check_incremental<int>(topk, timeout);
             check_incremental<int64_t>(topk, timeout);
         }
     }
+    for (int topk = 1; topk <= 32; ++topk) {
+        check_backlog<int>(topk, 23, timeout);
+        check_backlog<int64_t>(topk, 23, timeout);
+    }
+    check_backlog<int>(8, 4101, timeout);
+    check_backlog<int64_t>(3, 4101, timeout);
+    check_tile_overflow(timeout);
     check_terminal(0, 2, 2, 0, 1, recv_x_ready::kCapacityExceeded, timeout);
     check_terminal(0, 3, 2, 0, 2, recv_x_ready::kInvalidRange, timeout);
     check_terminal(0, 2, 3, 0, 2, recv_x_ready::kInvalidProgress, timeout);

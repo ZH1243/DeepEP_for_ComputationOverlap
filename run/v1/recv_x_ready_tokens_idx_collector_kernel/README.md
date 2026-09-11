@@ -21,24 +21,37 @@ publication branch or store. The code targets CUDA 12.9 / Hopper.
 
 The **same eight warps** alternate between gathering and expert compaction.
 In one gathering phase, warp `w` polls range `range_group + w`, acquire-loads
-its frontier, and takes at most four newly ready rows. Its lanes cooperatively
-read each row's top-k entries and reduce them to an eight-bit expert membership
-mask. The CTA's shared tile holds up to 32 row indices and membership masks;
-unused slots carry a zero mask. This avoids rereading routing metadata once
-per expert. No token payload enters the shared tile.
+its frontier, and takes at most **16 newly ready rows**. The shared tile holds
+up to **128 row indices and membership masks** (1 KB); unused slots have zero
+membership. Partial tiles are processed immediately, without waiting to fill.
 
-After a CTA barrier, warp `e` processes all 32 tile slots for expert `e`.
-Ballot/popcount gives matching lanes consecutive append positions. The warp
-writes those entries, synchronizes, and its leader release-stores the new
-committed count. Another CTA barrier protects shared tile reuse. Range groups
-rotate after every tile even when one range has a large backlog. Partial tiles
-are processed immediately. Empty polls use a short `__nanosleep` backoff.
-Polling acquires and progress publications use Hopper's L1 no-allocate cache
-hint, keeping the small synchronization surface in L2 and avoiding L1 cache
-pollution in both the dispatch receiver and the collector.
+Top-k 1/2/4/8/16/32 has compile-time specializations: a power-of-two subgroup
+loads one row, so top-k 8 loads four rows per warp instruction. Subgroup OR
+reductions build membership masks and deduplicate expert IDs. Other top-k
+values retain a generic full-warp reduction. Both int32 and int64 are supported.
+
+After a CTA barrier, warp `e` compacts four 32-row segments for expert `e`.
+Ballot/popcount gives matching lanes consecutive append positions. Capacity is
+checked for the entire tile before any tile output is written. The warp writes
+all segments, synchronizes, and release-stores one updated committed count.
+CTA synchronization protects shared tile reuse and terminal publication.
+
+Range cursors and immutable final offsets are cached in dynamic shared memory
+for the first 4096 ranges (8 bytes per cached range). Initial descriptors are
+validated after acquire; the initial begin is then represented by the advancing
+cursor. Completed cached ranges skip further polling. Larger range counts use
+the existing global workspace for the uncached tail, avoiding a new API limit.
+Cached `consumed_end` entries are flushed on every terminal exit, including
+errors; this workspace is **not a live progress signal**. Use `ready_count`.
+
+Per-warp shared slots replace activity/completion atomics. Empty groups skip
+routing work and compaction. Range groups rotate after every tile, and a short
+`__nanosleep` backoff occurs only after a **complete scan with no activity**.
+Polling acquires and progress publications retain the Hopper L1 no-allocate
+hint and the existing release/acquire protocol.
 
 There are no global atomic increments on expert counts. Shared-memory atomics
-maintain error/activity/completion bookkeeping. List order depends on observed
+record errors only. List order depends on observed
 arrival progress, is not globally sorted, and is not deterministic across runs.
 Repeated expert IDs in one row are deduplicated: a row appears once per expert.
 
@@ -235,8 +248,10 @@ committed list entry. This checks incremental publication, including visibility
 of simulated payload stores through both release/acquire handoffs. Final lists
 are compared against a CPU membership reference. Coverage includes multiple
 polling groups, uneven/empty ranges, partial tiles, int32/int64 routing, top-k
-1/8/32, duplicate memberships, repeated invocations with fresh state, capacity
-overflow, invalid descriptors/frontiers/experts, and timeout. The simulated
+specializations and generic fallback, duplicate memberships, repeated invocations with fresh state, capacity
+overflow, invalid descriptors/frontiers/experts, and timeout. All-ready backlog
+checks cover every top-k from 1 through 32 in both dtypes, repeated 128-row
+tiles, partial tiles, more than 4096 ranges, and whole-tile capacity rejection. The simulated
 producer uses ordinary CUDA stores; actual DeepEP TMA integration needs its own
 correctness and performance checks.
 
@@ -254,3 +269,15 @@ publications and the collector separately. Also measure first useful expert
 batch latency, publication delay, and collector backlog. One CTA and a small
 metadata footprint do not imply zero dispatch slowdown or sufficient collector
 throughput for every routing workload.
+
+## Rerunning after collector optimization
+
+The Python API and dispatch test command are unchanged. In a fresh Python
+process, `build()` automatically rebuilds the collector extension from the
+changed CUDA source. No DeepEP extension rebuild is needed for this collector-only
+change. Run the standalone protocol test above first, then your existing
+`deepep_v1_internode_dispatch_with_ready_tokens_collector.py --with-collector`
+command and compare dispatch duration, collector duration, and collector finish
+lag in Nsight Systems. The script's printed dispatch timing is not a separate
+collector-duration measurement. GPU correctness and performance must be checked
+on Hopper; the optimization does not assume a particular measured speedup.

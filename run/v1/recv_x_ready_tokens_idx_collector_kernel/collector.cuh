@@ -7,7 +7,7 @@ namespace recv_x_ready {
 
 constexpr int kExperts = 8;
 constexpr int kThreads = 256;
-constexpr int kRowsPerRange = 4;
+constexpr int kRowsPerRange = 16;
 constexpr int kTileRows = kExperts * kRowsPerRange;
 
 enum Status : int {
@@ -60,6 +60,8 @@ __device__ __forceinline__ void publish_ready(
 // range descriptors once initialized; monotonic absolute ready_end values.
 // Outputs: idx_list[8, capacity] (int32), ready_count[8] (int32).
 // Workspace: consumed_end[num_ranges] initially -1; status[1] initially 0.
+// Cached consumed_end entries are written back only on terminal exit (including
+// errors). This private workspace must not be used to observe live progress.
 // ready_count must initially be zero. List entries need not be initialized.
 // timeout_cycles == 0 disables the watchdog; otherwise it limits cycles without
 // any newly gathered rows or newly completed ranges. Launches exactly ONE CTA.
