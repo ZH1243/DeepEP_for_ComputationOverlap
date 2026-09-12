@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         default=10000.0,
         help="collector idle timeout; zero disables it",
     )
+    parser.add_argument("--gather-tile-m", type=int, default=256)
+    parser.add_argument("--gather-cluster-m", type=int, default=2)
+    parser.add_argument("--gather-tile-n", type=int, default=256)
+    parser.add_argument("--gather-output-dim", type=int, default=4096,
+                        help="future GEMM N width (use doubled width for gated projections)")
+    parser.add_argument("--gather-max-swizzle-size", type=int, default=8)
     return parser.parse_args()
 
 
@@ -53,6 +59,13 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("--deepep-num-sms must be a positive even number for internode dispatch.")
     if not 0.0 <= args.collector_timeout_ms <= 3600000.0:
         raise ValueError("--collector-timeout-ms must be in [0, 3600000].")
+    geometry = (args.gather_tile_m, args.gather_cluster_m, args.gather_tile_n,
+                args.gather_output_dim, args.gather_max_swizzle_size)
+    if any(value <= 0 for value in geometry):
+        raise ValueError("gather geometry must be positive")
+    clusters_n = (args.gather_output_dim + args.gather_tile_n - 1) // args.gather_tile_n
+    if clusters_n % min(args.gather_max_swizzle_size, clusters_n):
+        raise ValueError("N clusters must be divisible by gather group size")
     if args.with_collector:
         sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         if args.deepep_num_sms >= sm_count:
@@ -79,7 +92,37 @@ def check_collector_output(
         expected = torch.nonzero((recv_topk_idx == expert).any(dim=1)).flatten().cpu().tolist()
         actual = state.indices[expert, :counts[expert]].cpu().tolist()
         indices_ok &= sorted(actual) == expected
-    return descriptor_ok and indices_ok, counts
+    table_ok = check_gather_output(state, counts)
+    return descriptor_ok and indices_ok and table_ok, counts
+
+
+def check_gather_output(state, counts: list[int]) -> bool:
+    """Compare every bundle against the committed expert lists after completion."""
+    c = state.gather_table.shape[1] - 2
+    groups = state.gather_num_n_groups
+    q = int(state.gather_ready_rows.item())
+    expected_q = sum((count + c - 1) // c for count in counts) * groups
+    if q != expected_q or q > state.gather_table.shape[0]:
+        return False
+    if state.written_count.cpu().tolist() != counts:
+        return False
+    table = state.gather_table[:q].cpu().tolist()
+    indices = [state.indices[e, :counts[e]].cpu().tolist() for e in range(8)]
+    cursors = [0] * 8
+    for first in range(0, q, groups):
+        expert = table[first][0]
+        if not 0 <= expert < 8:
+            return False
+        start = cursors[expert]
+        take = min(c, counts[expert] - start)
+        if take <= 0:
+            return False
+        expected = indices[expert][start:start + take] + [-1] * (c - take)
+        for n in range(groups):
+            if table[first + n] != [expert, n * state.gather_group_size, *expected]:
+                return False
+        cursors[expert] += take
+    return cursors == counts
 
 
 @torch.no_grad()
@@ -126,9 +169,14 @@ def run_dispatch(
         recv_topk_idx_buffer = torch.empty(
             (max_recv_rows, args.topk), dtype=token_indices.dtype, device=token_indices.device
         )
+        clusters_n = (args.gather_output_dim + args.gather_tile_n - 1) // args.gather_tile_n
+        group_size = min(args.gather_max_swizzle_size, clusters_n)
         collector_state = allocate_state(
             num_ranges=num_ranges,
             num_rows=max_recv_rows,
+            gather_cluster_rows=args.gather_tile_m * args.gather_cluster_m,
+            gather_num_n_groups=clusters_n // group_size,
+            gather_group_size=group_size,
             device=token_indices.device,
         )
         collector_stream = torch.cuda.Stream(device=token_indices.device)
@@ -218,6 +266,7 @@ def run_dispatch(
         "tokens_per_local_expert": tokens_per_expert,
         "collector_ok": collector_ok,
         "collector_counts": collector_counts,
+        "gather_ready_rows": int(collector_state.gather_ready_rows.item()) if collector_state else None,
     }
     return float(start.elapsed_time(end)), meta
 
@@ -320,7 +369,8 @@ def main() -> int:
             f"[rank {rank}] recv_x={last_meta['recv_x_shape']} "
             f"recv_topk_indices={last_meta['recv_topk_indices_shape']} "
             f"tokens_per_local_expert={last_meta['tokens_per_local_expert']} "
-            f"collector_counts={last_meta['collector_counts']} sanity_ok={local_ok}"
+            f"collector_counts={last_meta['collector_counts']} "
+            f"gather_ready_rows={last_meta['gather_ready_rows']} sanity_ok={local_ok}"
         ),
     )
     if args.print_timing:

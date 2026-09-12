@@ -11,6 +11,65 @@ tensors through `ready_token_state=(range_begin, range_end, ready_end)`. The
 ordinary path selects a separate CUDA template specialization and executes no
 publication branch or store. The code targets CUDA 12.9 / Hopper.
 
+## Indexed gather-table output
+
+The Python collector now also prepares QuACK's **single-buffer indexed gather**
+format, with `recv_x` as X. No GEMM is launched. The CTA remains 256 threads.
+
+| Buffer | Type and shape | Meaning |
+|---|---|---|
+| `gather_table` | int32 `[Q_capacity, 2 + C]` | Rows `(expert_id, cid_n_base, recv_x_idx_0, ..., recv_x_idx_{C-1})` |
+| `gather_ready_rows` | int32 `[1]`, initially zero | Exclusive committed table-row prefix |
+| `written_count` | int32 `[8]`, initially zero | Actual tokens copied into table bundles per expert; excludes padding and repeated N-group copies |
+
+Set `C = gather_cluster_rows = tile_m * cluster_m`. With
+`clusters_n = ceil(gemm_N / tile_n)`, set `gather_group_size` to
+`min(max_swizzle_size, clusters_n)` and `gather_num_n_groups` to
+`clusters_n / gather_group_size` (must divide exactly). Python defaults are
+C=512, group size=8, two N groups, matching the referenced QuACK runner's
+256×256 tile, cluster_m=2, N=4096 defaults. These parameters describe the table;
+the future GEMM must also use a supported matching kernel configuration.
+Width 4 (C=2) is rejected because QuACK treats it as the non-indexed format.
+
+After compaction, each expert warp emits all available full C-token batches.
+Only after **all ranges finish** does it flush a remaining partial batch with
+trailing `-1` indices; empty experts emit no rows. Each batch emits consecutive
+N-group rows with bases `0, group_size, ...`. Every N-group row repeats the same
+indices. The CTA assigns contiguous bundle slots, synchronizes all writes, then
+thread 0 release-stores `gather_ready_rows`. A GPU consumer must acquire this
+flag before reading the table and payload. `written_count` is per-expert
+progress; it is not the table's global commit signal. Its update can precede
+that global commit. Previously committed table rows are immutable.
+
+Bundle order follows observed readiness, so experts may be interleaved. For
+bundle b, QuACK's output rows are `[b*C, (b+1)*C)`, not fixed expert-contiguous
+segments. A future output/reference or down-projection path must honor that
+ordering. The table contains direct recv_x row indices, not pointers, and does
+not copy recv_x. Keep recv_x alive through any future consumer.
+
+Allocation uses `Q_capacity = 8 * ceil(capacity / C) * num_n_groups` without a
+host count read or dispatch completion wait. Only
+`gather_table[:gather_ready_rows]` is valid. On successful completion,
+`written_count == ready_count` and final Q is
+`sum(ceil(ready_count[e] / C)) * num_n_groups`.
+**QuACK currently schedules by table.shape[0]**, so do not pass the entire
+worst-case allocation to a live GEMM: it would wait on unused rows. Future live
+integration needs an exact Q from routing metadata before launching GEMM, or
+scheduler end-of-stream support. A post-completion consumer can use a view of
+the final Q rows. This step deliberately launches only dispatch and collector.
+
+The existing dispatch command with `--with-collector` now allocates and verifies
+the table too. Optional arguments are `--gather-tile-m`, `--gather-cluster-m`,
+`--gather-tile-n`, `--gather-output-dim`, and `--gather-max-swizzle-size`.
+For a gated projection, pass the full (doubled) GEMM N width as output dim.
+The test prints `gather_ready_rows` after completion and validates every row,
+N-group replica, padding slot, and per-expert token sequence.
+
+Raw CUDA callers may append a `GatherTable` to `launch_collector`; the default
+empty struct preserves index-only operation. Table overflow reports status 7
+without publishing any of the failed iteration's bundles. Earlier table
+prefixes remain valid; index counts can be ahead of written counts on failure.
+
 ## Files and operation
 
 - `collector.cuh`: raw CUDA launch API and producer/consumer publication helpers.
@@ -224,6 +283,7 @@ of the producer. Join every participating stream before freeing/reusing buffers.
 | 4 | Invalid observed readiness frontier |
 | 5 | Routing value outside `[-1, 7]` |
 | 6 | No gathering/completion progress before idle timeout |
+| 7 | Gather table capacity exceeded |
 
 The watchdog is approximate (`clock64`, converted using GPU clock rate).
 `timeout_ms=0` disables it. On an error, previously committed prefixes remain
@@ -244,7 +304,7 @@ nvcc -O3 -std=c++17 -arch=sm_90 -lineinfo \
 ```
 
 The synthetic producer withholds final rows until a live consumer observes a
-committed list entry. This checks incremental publication, including visibility
+committed gather-table bundle. This checks incremental publication, including visibility
 of simulated payload stores through both release/acquire handoffs. Final lists
 are compared against a CPU membership reference. Coverage includes multiple
 polling groups, uneven/empty ranges, partial tiles, int32/int64 routing, top-k
@@ -272,7 +332,7 @@ throughput for every routing workload.
 
 ## Rerunning after collector optimization
 
-The Python API and dispatch test command are unchanged. In a fresh Python
+The dispatch test command is unchanged; Python state now includes gather outputs. In a fresh Python
 process, `build()` automatically rebuilds the collector extension from the
 changed CUDA source. No DeepEP extension rebuild is needed for this collector-only
 change. Run the standalone protocol test above first, then your existing

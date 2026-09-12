@@ -16,7 +16,7 @@ __global__ __launch_bounds__(kThreads, 1) void collect(
     const int* __restrict__ ready_end, int num_ranges,
     int* __restrict__ idx_list, int capacity, int* __restrict__ ready_count,
     int* __restrict__ consumed_end, int* __restrict__ status,
-    unsigned long long timeout_cycles) {
+    unsigned long long timeout_cycles, GatherTable gather) {
     const int tid = threadIdx.x;
     const int warp = tid / 32;
     const int lane = tid % 32;
@@ -39,17 +39,23 @@ __global__ __launch_bounds__(kThreads, 1) void collect(
     __shared__ int finished_ranges;
     __shared__ int failure;
     __shared__ int watchdog_status;
+    __shared__ int bundle_count[kExperts];
+    __shared__ int bundle_start[kExperts];
+    __shared__ int table_rows;
+
     for (int r = tid; r < cached_ranges; r += kThreads) {
         cursor[r] = -1;
         final_end[r] = -1;
     }
     if (tid == 0) {
+        table_rows = 0;
         finished_ranges = 0;
         failure = kRunning;
     }
     __syncthreads();
 
     int expert_count = 0;
+    int written_count = 0;
     int range_group = 0;
     bool scan_activity = false;
     unsigned long long last_activity = clock64();
@@ -186,6 +192,57 @@ __global__ __launch_bounds__(kThreads, 1) void collect(
         // Protect both the tile and the per-warp bookkeeping from reuse; also
         // carry all expert publications to the terminal status writer.
         __syncthreads();
+        if (gather.ready_rows != nullptr) {
+            // Each expert owns a warp. Reserve entire N-group bundles in a
+            // deterministic prefix within this iteration; arrival order across
+            // iterations is intentionally dynamic.
+            const int pending = expert_count - written_count;
+            const bool final = finished_ranges == num_ranges;
+            const int batches = pending / gather.cluster_rows +
+                (final && pending % gather.cluster_rows != 0);
+            if (lane == 0)
+                bundle_count[warp] = batches;
+            __syncthreads();
+            if (tid == 0) {
+                int64_t next = table_rows;
+                for (int e = 0; e < kExperts; ++e) {
+                    bundle_start[e] = static_cast<int>(next);
+                    next += static_cast<int64_t>(bundle_count[e]) * gather.num_n_groups;
+                }
+                if (next > gather.capacity_rows)
+                    failure = kTableCapacityExceeded;
+                else
+                    table_rows = static_cast<int>(next);
+            }
+            __syncthreads();
+            if (failure != kRunning) {
+                terminal = failure;
+                break;
+            }
+            for (int b = 0; b < batches; ++b) {
+                const int take = min(expert_count - written_count, gather.cluster_rows);
+                for (int n = 0; n < gather.num_n_groups; ++n) {
+                    const int row = bundle_start[warp] + b * gather.num_n_groups + n;
+                    int* entry = gather.table + static_cast<int64_t>(row) * (2 + gather.cluster_rows);
+                    if (lane == 0) {
+                        entry[0] = warp;
+                        entry[1] = n * gather.group_size;
+                    }
+                    for (int i = lane; i < gather.cluster_rows; i += 32)
+                        entry[2 + i] = i < take
+                            ? idx_list[static_cast<int64_t>(warp) * capacity + written_count + i] : -1;
+                }
+                written_count += take;
+            }
+            __syncwarp(full);
+            if (lane == 0 && batches != 0)
+                store_release(gather.written_count + warp, written_count);
+            // Transfer all table/index/payload visibility to the prefix writer.
+            __syncthreads();
+            if (tid == 0)
+                store_release(gather.ready_rows, table_rows);
+            __syncthreads();
+        }
         if (finished_ranges == num_ranges) {
             terminal = kComplete;
             break;
@@ -233,13 +290,13 @@ cudaError_t launch_typed(
     const int* range_begin, const int* range_end, const int* ready_end,
     int num_ranges, int* idx_list, int capacity, int* ready_count,
     int* consumed_end, int* status, unsigned long long timeout_cycles,
-    cudaStream_t stream) {
+    cudaStream_t stream, GatherTable gather) {
     const size_t shared_bytes = 2 * sizeof(int) * (num_ranges < kMaxCachedRanges ? num_ranges : kMaxCachedRanges);
 #define LAUNCH(TOPK) \
     collect<Index, TOPK><<<1, kThreads, shared_bytes, stream>>>( \
         static_cast<const Index*>(topk), num_rows, num_topk, \
         range_begin, range_end, ready_end, num_ranges, idx_list, capacity, \
-        ready_count, consumed_end, status, timeout_cycles)
+        ready_count, consumed_end, status, timeout_cycles, gather)
     switch (num_topk) {
         case 1: LAUNCH(1); break;
         case 2: LAUNCH(2); break;
@@ -259,17 +316,24 @@ cudaError_t launch_collector(
     const int* range_begin, const int* range_end, const int* ready_end,
     int num_ranges, int* idx_list, int capacity, int* ready_count,
     int* consumed_end, int* status, unsigned long long timeout_cycles,
-    cudaStream_t stream) {
+    cudaStream_t stream, GatherTable gather) {
     if (num_rows < 0 || num_topk < 1 || num_topk > 32 || num_ranges < 1 || capacity < 0)
+        return cudaErrorInvalidValue;
+    if (gather.ready_rows != nullptr &&
+        (gather.written_count == nullptr || gather.capacity_rows < 0 ||
+         (gather.capacity_rows > 0 && gather.table == nullptr) ||
+         gather.cluster_rows < 1 || gather.cluster_rows > INT32_MAX - 2 ||
+         gather.cluster_rows == 2 || gather.num_n_groups < 1 || gather.group_size < 1 ||
+         static_cast<int64_t>(gather.num_n_groups) * gather.group_size > INT32_MAX))
         return cudaErrorInvalidValue;
     if (topk_is_int64) {
         return launch_typed<int64_t>(recv_topk_idx, num_rows, num_topk,
             range_begin, range_end, ready_end, num_ranges, idx_list, capacity,
-            ready_count, consumed_end, status, timeout_cycles, stream);
+            ready_count, consumed_end, status, timeout_cycles, stream, gather);
     }
     return launch_typed<int>(recv_topk_idx, num_rows, num_topk,
         range_begin, range_end, ready_end, num_ranges, idx_list, capacity,
-        ready_count, consumed_end, status, timeout_cycles, stream);
+        ready_count, consumed_end, status, timeout_cycles, stream, gather);
 }
 
 }  // namespace recv_x_ready

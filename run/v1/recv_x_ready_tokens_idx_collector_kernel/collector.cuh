@@ -18,6 +18,7 @@ enum Status : int {
     kInvalidProgress = 4,
     kInvalidExpert = 5,
     kIdleTimeout = 6,
+    kTableCapacityExceeded = 7,
 };
 
 // All buffers are on the same GPU, in the same memory synchronization domain.
@@ -56,6 +57,20 @@ __device__ __forceinline__ void publish_ready(
 }
 #endif
 
+// Optional single-buffer QuACK indexed table. Zero counters before launch.
+// Each bundle has num_n_groups consecutive rows [expert, n * group_size,
+// cluster_rows direct recv_x indices], with trailing -1 in the final batch.
+// ready_rows is a GPU release/acquire committed prefix, never a reservation.
+struct GatherTable {
+    int* table = nullptr;
+    int* ready_rows = nullptr;
+    int* written_count = nullptr;  // [8], actual tokens (excludes padding/N copies)
+    int capacity_rows = 0;
+    int cluster_rows = 0;
+    int num_n_groups = 0;
+    int group_size = 0;
+};
+
 // Inputs: contiguous recv_topk_idx[num_rows, num_topk], int32 or int64; immutable
 // range descriptors once initialized; monotonic absolute ready_end values.
 // Outputs: idx_list[8, capacity] (int32), ready_count[8] (int32).
@@ -71,6 +86,6 @@ cudaError_t launch_collector(
     const int* range_begin, const int* range_end, const int* ready_end,
     int num_ranges, int* idx_list, int capacity, int* ready_count,
     int* consumed_end, int* status, unsigned long long timeout_cycles,
-    cudaStream_t stream);
+    cudaStream_t stream, GatherTable gather = {});
 
 }  // namespace recv_x_ready

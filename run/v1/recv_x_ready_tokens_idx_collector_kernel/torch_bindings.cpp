@@ -20,12 +20,14 @@ void launch(
     const torch::Tensor& begin, const torch::Tensor& end, const torch::Tensor& ready,
     const torch::Tensor& indices, const torch::Tensor& counts,
     const torch::Tensor& consumed, const torch::Tensor& status,
+    const torch::Tensor& table, const torch::Tensor& table_ready,
+    const torch::Tensor& written, int num_n_groups, int group_size,
     unsigned long long timeout_cycles) {
     TORCH_CHECK(topk.is_cuda() && topk.is_contiguous() && topk.dim() == 2,
                 "recv_topk_idx must be a contiguous CUDA matrix");
     TORCH_CHECK(topk.scalar_type() == torch::kInt32 || topk.scalar_type() == torch::kInt64,
                 "recv_topk_idx must have dtype int32 or int64");
-    for (const auto& tensor : {begin, end, ready, indices, counts, consumed, status}) {
+    for (const auto& tensor : {begin, end, ready, indices, counts, consumed, status, table, table_ready, written}) {
         TORCH_CHECK(tensor.is_cuda() && tensor.device() == topk.device() &&
                     tensor.is_contiguous() && tensor.scalar_type() == torch::kInt32,
                     "state tensors must be contiguous int32 tensors on recv_topk_idx's GPU");
@@ -41,6 +43,18 @@ void launch(
     TORCH_CHECK(counts.dim() == 1 && counts.numel() == recv_x_ready::kExperts &&
                 status.dim() == 1 && status.numel() == 1, "invalid count/status shape");
 
+    TORCH_CHECK(table.dim() == 2 && table.size(0) <= max_int &&
+                table.size(1) >= 3 && table.size(1) <= max_int && table.size(1) != 4,
+                "invalid indexed gather table shape");
+    TORCH_CHECK(table_ready.dim() == 1 && table_ready.numel() == 1 &&
+                written.sizes() == counts.sizes(), "invalid gather counter shape");
+    TORCH_CHECK(num_n_groups > 0 && group_size > 0 &&
+                static_cast<int64_t>(num_n_groups) * group_size <= max_int,
+                "invalid N-group geometry");
+    recv_x_ready::GatherTable gather{
+        table.data_ptr<int>(), table_ready.data_ptr<int>(), written.data_ptr<int>(),
+        static_cast<int>(table.size(0)), static_cast<int>(table.size(1) - 2),
+        num_n_groups, group_size};
     const c10::cuda::CUDAGuard guard(topk.device());
     C10_CUDA_CHECK(recv_x_ready::launch_collector(
         topk.data_ptr(), topk.scalar_type() == torch::kInt64,
@@ -49,7 +63,7 @@ void launch(
         static_cast<int>(begin.numel()), indices.data_ptr<int>(),
         static_cast<int>(indices.size(1)), counts.data_ptr<int>(), consumed.data_ptr<int>(),
         status.data_ptr<int>(), timeout_cycles,
-        c10::cuda::getCurrentCUDAStream(topk.get_device()).stream()));
+        c10::cuda::getCurrentCUDAStream(topk.get_device()).stream(), gather));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {

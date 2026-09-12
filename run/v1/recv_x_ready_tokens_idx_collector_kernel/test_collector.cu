@@ -105,9 +105,10 @@ __global__ void producer(
 __global__ void observer(
     const int* indices, const int* counts, const int* status, const int* payload,
     int rows, int num_topk, int capacity, int* observed, int* error,
-    unsigned long long timeout) {
+    unsigned long long timeout, recv_x_ready::GatherTable gather) {
     const int lane = threadIdx.x;
     int seen = 0;
+    int seen_table = 0;
     const auto started = clock64();
     while (true) {
         int terminal = lane == 0 ? recv_x_ready::load_acquire(status) : 0;
@@ -135,8 +136,39 @@ __global__ void observer(
             seen = count;
         }
         const bool any = __any_sync(0xffffffffu, count > 0);
-        if (lane == 0 && any)
-            recv_x_ready::store_release(observed, 1);
+        if (lane == 0) {
+            const int q = recv_x_ready::load_acquire(gather.ready_rows);
+            if (q < seen_table || q > gather.capacity_rows || q % gather.num_n_groups != 0) {
+                atomicExch(error, 6);
+                return;
+            }
+            for (int r = seen_table; r < q; ++r) {
+                const int* entry = gather.table + r * (2 + gather.cluster_rows);
+                const int expert = entry[0];
+                if (expert < 0 || expert >= 8 ||
+                    entry[1] != (r % gather.num_n_groups) * gather.group_size)
+                    atomicExch(error, 7);
+                bool padding = false;
+                for (int i = 0; i < gather.cluster_rows; ++i) {
+                    const int row = entry[2 + i];
+                    if (row == -1) {
+                        padding = true;
+                    } else if (padding || row < 0 || row >= rows) {
+                        atomicExch(error, 8);
+                    } else {
+                        bool belongs = false;
+                        for (int k = 0; k < num_topk; ++k)
+                            belongs |= route(row, k) == expert;
+                        if (!belongs || payload[row] != row * 7 + 11)
+                            atomicExch(error, 9);
+                    }
+                }
+            }
+            seen_table = q;
+            // Gate the producer on TABLE visibility, not just index visibility.
+            if (any && q > 0)
+                recv_x_ready::store_release(observed, 1);
+        }
         if (terminal != recv_x_ready::kRunning)
             return;
         const bool expired = __any_sync(0xffffffffu, clock64() - started > timeout);
@@ -161,6 +193,14 @@ void check_incremental(int num_topk, unsigned long long timeout) {
     DeviceArray<Index> topk(rows * num_topk);
     DeviceArray<int> payload(rows), boundaries(ranges + 1), begin(ranges), end(ranges), ready(ranges);
     DeviceArray<int> indices(8 * rows), counts(8), consumed(ranges), status(1), observed(1), error(1);
+    constexpr int cluster_rows = 17, groups = 3, group_size = 2;
+    const int table_capacity = 8 * ((rows + cluster_rows - 1) / cluster_rows) * groups;
+    DeviceArray<int> table(table_capacity * (2 + cluster_rows)), table_ready(1), written(8);
+    table.fill_bytes(0x7f);
+    table_ready.fill_bytes(0);
+    written.fill_bytes(0);
+    recv_x_ready::GatherTable gather{table.ptr, table_ready.ptr, written.ptr,
+        table_capacity, cluster_rows, groups, group_size};
     boundaries.put(bounds);
     topk.fill_bytes(0x7f);  // Reading unpublished metadata should fail loudly.
     payload.fill_bytes(0xff);
@@ -182,10 +222,10 @@ void check_incremental(int num_topk, unsigned long long timeout) {
     CUDA_CHECK(recv_x_ready::launch_collector(
         topk.ptr, std::is_same<Index, int64_t>::value, rows, num_topk,
         begin.ptr, end.ptr, ready.ptr, ranges, indices.ptr, rows, counts.ptr,
-        consumed.ptr, status.ptr, timeout, collector_stream));
+        consumed.ptr, status.ptr, timeout, collector_stream, gather));
     observer<<<1, 32, 0, observer_stream>>>(
         indices.ptr, counts.ptr, status.ptr, payload.ptr, rows, num_topk, rows,
-        observed.ptr, error.ptr, timeout);
+        observed.ptr, error.ptr, timeout, gather);
     CUDA_CHECK(cudaGetLastError());
     producer<<<1, 32, 0, producer_stream>>>(
         topk.ptr, num_topk, payload.ptr, boundaries.ptr, ranges, begin.ptr, end.ptr,
@@ -197,6 +237,30 @@ void check_incremental(int num_topk, unsigned long long timeout) {
     CHECK(error.get()[0] == 0);
     const auto actual_counts = counts.get();
     const auto actual_indices = indices.get();
+    CHECK(written.get() == actual_counts);
+    const auto actual_table = table.get();
+    const int q = table_ready.get()[0];
+    int expected_q = 0;
+    for (int count : actual_counts)
+        expected_q += ((count + cluster_rows - 1) / cluster_rows) * groups;
+    CHECK(q == expected_q);
+    std::vector<int> cursor(8, 0);
+    for (int r = 0; r < q; r += groups) {
+        const int expert = actual_table[r * (2 + cluster_rows)];
+        CHECK(expert >= 0 && expert < 8);
+        const int take = std::min(cluster_rows, actual_counts[expert] - cursor[expert]);
+        CHECK(take > 0);
+        for (int n = 0; n < groups; ++n) {
+            const int base = (r + n) * (2 + cluster_rows);
+            CHECK(actual_table[base] == expert);
+            CHECK(actual_table[base + 1] == n * group_size);
+            for (int i = 0; i < cluster_rows; ++i)
+                CHECK(actual_table[base + 2 + i] == (i < take
+                    ? actual_indices[expert * rows + cursor[expert] + i] : -1));
+        }
+        cursor[expert] += take;
+    }
+    CHECK(cursor == actual_counts);
     const auto actual_consumed = consumed.get();
     for (int r = 0; r < ranges; ++r)
         CHECK(actual_consumed[r] == bounds[r + 1]);

@@ -19,6 +19,7 @@ _STATUS = {
     4: "invalid readiness frontier",
     5: "routing entry is outside [-1, 7]",
     6: "collector idle timeout: producer stopped publishing or did not run",
+    7: "gather table capacity exceeded",
 }
 
 
@@ -56,6 +57,11 @@ class CollectorState:
     ready_count: torch.Tensor
     consumed_end: torch.Tensor
     status: torch.Tensor
+    gather_table: torch.Tensor
+    gather_ready_rows: torch.Tensor
+    written_count: torch.Tensor
+    gather_num_n_groups: int
+    gather_group_size: int
     initialized: torch.cuda.Event
     clock_rate_khz: int
     _launched: bool = False
@@ -64,6 +70,7 @@ class CollectorState:
         return (
             self.range_begin, self.range_end, self.ready_end, self.indices,
             self.ready_count, self.consumed_end, self.status,
+            self.gather_table, self.gather_ready_rows, self.written_count,
         )
 
 
@@ -89,11 +96,17 @@ def allocate_state(
     *,
     capacity: Optional[int] = None,
     device=None,
+    gather_cluster_rows: int = 512,
+    gather_num_n_groups: int = 2,
+    gather_group_size: int = 8,
 ) -> CollectorState:
     """Allocate fresh state; producers must wait for state.initialized.
 
     By default each expert can hold every received row. Buffers must not alias
     each other or producer payloads. One state belongs to exactly one dispatch.
+    Gather geometry defaults to QuACK tile_m=tile_n=256, cluster_m=2, N=4096,
+    max_swizzle_size=8. The table allocation is a capacity, not a final work count;
+    only its gather_ready_rows prefix is committed (see README.md).
     """
     if capacity is None:
         capacity = num_rows
@@ -102,6 +115,16 @@ def allocate_state(
     ):
         if not isinstance(value, int) or not minimum <= value <= 2**31 - 1:
             raise ValueError(f"{name} must be an integer in [{minimum}, INT_MAX]")
+    for name, value in (("gather_cluster_rows", gather_cluster_rows),
+                        ("gather_num_n_groups", gather_num_n_groups),
+                        ("gather_group_size", gather_group_size)):
+        if not isinstance(value, int) or not 1 <= value <= 2**31 - 3:
+            raise ValueError(f"{name} must be a positive int32 integer")
+    if gather_cluster_rows == 2:
+        raise ValueError("cluster_rows=2 produces width 4, which QuACK interprets as non-indexed")
+    table_rows = 8 * ((capacity + gather_cluster_rows - 1) // gather_cluster_rows) * gather_num_n_groups
+    if max(table_rows, gather_num_n_groups * gather_group_size) > 2**31 - 1:
+        raise ValueError("gather table row count and N geometry must fit in int32")
     device = torch.device("cuda" if device is None else device)
     if device.type != "cuda":
         raise ValueError("state must be allocated on a CUDA device")
@@ -119,6 +142,11 @@ def allocate_state(
             ready_count=torch.zeros(8, **options),
             consumed_end=torch.full((num_ranges,), -1, **options),
             status=torch.zeros(1, **options),
+            gather_table=torch.empty((table_rows, 2 + gather_cluster_rows), **options),
+            gather_ready_rows=torch.zeros(1, **options),
+            written_count=torch.zeros(8, **options),
+            gather_num_n_groups=gather_num_n_groups,
+            gather_group_size=gather_group_size,
             initialized=torch.cuda.Event(),
             # clock_rate is kHz, equivalently cycles per millisecond.
             clock_rate_khz=clock_rate_khz,
@@ -154,7 +182,8 @@ def launch(
             raise ValueError("collector stream and state must be on the same GPU")
         with torch.cuda.stream(stream):
             stream.wait_event(state.initialized)
-            extension.launch(recv_topk_idx, *state.tensors(), timeout_cycles)
+            extension.launch(recv_topk_idx, *state.tensors(),
+                             state.gather_num_n_groups, state.gather_group_size, timeout_cycles)
             state._launched = True
             for tensor in (recv_topk_idx, *state.tensors()):
                 tensor.record_stream(stream)
