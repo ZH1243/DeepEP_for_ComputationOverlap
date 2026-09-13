@@ -74,6 +74,9 @@ its notification-produced CPU list `num_recv_tokens_per_expert` supplies the
 exact size `Q = sum(ceil(count[e] / C)) * num_n_groups`. The test explicitly uses
 `expert_alignment=1` so these counts are unpadded. It allocates a new int32
 `[Q, 4 + C]` table on the collector stream before launching the collector.
+One collector stream is created before the warmup and measurement loops and
+reused for all iterations, allowing cached table storage to be reused on the
+same allocation stream. Collector state and counters remain fresh per dispatch.
 The existing initialization event still protects the counters and readiness
 state; table storage itself needs no initialization. This adds no explicit
 payload-completion wait or GPU count readback. A CUDA allocator cache miss can

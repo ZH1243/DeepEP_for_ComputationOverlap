@@ -136,7 +136,11 @@ def run_dispatch(
     input_tokens: torch.Tensor,
     token_indices: torch.Tensor,
     token_probs: torch.Tensor,
+    *,
+    collector_stream: torch.cuda.Stream | None,
 ) -> tuple[float, dict[str, Any]]:
+    if args.with_collector and collector_stream is None:
+        raise ValueError("with_collector requires the shared collector stream")
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     previous_event = base.make_initial_event(args.async_finish)
@@ -158,7 +162,6 @@ def run_dispatch(
 
     collector_run = None
     collector_state = None
-    collector_stream = None
     recv_topk_idx_buffer = None
     dispatch_previous_event = layout_event
     if args.with_collector:
@@ -186,7 +189,6 @@ def run_dispatch(
             gather_capacity_rows=0,
             device=token_indices.device,
         )
-        collector_stream = torch.cuda.Stream(device=token_indices.device)
     (
         recv_x,
         recv_token_indices,
@@ -332,6 +334,9 @@ def main() -> int:
         routing_ranks_per_node=args.routing_ranks_per_node,
     )
     buffer = base.get_buffer(ep_group, base.hidden_bytes(input_tokens))
+    # Reuse the allocation stream so warmup can populate the gather-table
+    # allocator cache used by every measured iteration.
+    collector_stream = torch.cuda.Stream(device=device) if args.with_collector else None
 
     base.ordered_print(
         rank,
@@ -354,7 +359,8 @@ def main() -> int:
                 exclude_local_node=args.exclude_local_node_routing,
                 routing_ranks_per_node=args.routing_ranks_per_node,
             )
-        run_dispatch(args, buffer, input_tokens, token_indices, token_probs)
+        run_dispatch(args, buffer, input_tokens, token_indices, token_probs,
+                     collector_stream=collector_stream)
     dist.barrier(group=ep_group)
 
     timings = []
@@ -367,7 +373,8 @@ def main() -> int:
                 exclude_local_node=args.exclude_local_node_routing,
                 routing_ranks_per_node=args.routing_ranks_per_node,
             )
-        ms, last_meta = run_dispatch(args, buffer, input_tokens, token_indices, token_probs)
+        ms, last_meta = run_dispatch(args, buffer, input_tokens, token_indices, token_probs,
+                                     collector_stream=collector_stream)
         timings.append(ms)
     dist.barrier(group=ep_group)
 
