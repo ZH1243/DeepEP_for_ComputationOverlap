@@ -102,7 +102,7 @@ def check_gather_output(state, counts: list[int]) -> bool:
     groups = state.gather_num_n_groups
     q = int(state.gather_ready_rows.item())
     expected_q = sum((count + c - 1) // c for count in counts) * groups
-    if q != expected_q or q > state.gather_table.shape[0]:
+    if q != expected_q or q != state.gather_table.shape[0]:
         return False
     if state.written_count.cpu().tolist() != counts:
         return False
@@ -181,6 +181,9 @@ def run_dispatch(
             gather_cluster_rows=args.gather_tile_m * args.gather_cluster_m,
             gather_num_n_groups=clusters_n // group_size,
             gather_group_size=group_size,
+            # Notification has not returned counts yet. Allocate only a zero-row
+            # placeholder here, alongside the producer's readiness state.
+            gather_capacity_rows=0,
             device=token_indices.device,
         )
         collector_stream = torch.cuda.Stream(device=token_indices.device)
@@ -199,6 +202,7 @@ def run_dispatch(
         num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
         is_token_in_rank=is_token_in_rank,
         num_tokens_per_expert=num_tokens_per_expert,
+        expert_alignment=1,  # Exact, unpadded counts for gather-table sizing.
         previous_event=dispatch_previous_event,
         async_finish=args.async_finish,
         allocate_on_comm_stream=args.allocate_on_comm_stream,
@@ -211,6 +215,23 @@ def run_dispatch(
         recv_topk_idx_buffer=recv_topk_idx_buffer,
     )
     if collector_state is not None:
+        # The uncached v1 dispatch returns these counts as a CPU list after
+        # notification. No payload-completion wait or device-to-host copy.
+        counts = num_recv_tokens_per_expert
+        if len(counts) != 8 or any(not isinstance(n, int) or n < 0 for n in counts):
+            raise ValueError("expected eight nonnegative CPU receive counts from notification")
+        cluster_rows = collector_state.gather_table.shape[1] - 4
+        table_rows = sum((n + cluster_rows - 1) // cluster_rows for n in counts)
+        table_rows *= collector_state.gather_num_n_groups
+        if table_rows > 2**31 - 1:
+            raise ValueError("exact gather table row count must fit in int32")
+        # Allocate on the collector stream: the compute stream may already
+        # wait for dispatch when async_finish=False. Every table entry is
+        # written before publication, so the empty storage needs no memset.
+        with torch.cuda.stream(collector_stream):
+            collector_state.gather_table = torch.empty(
+                (table_rows, 4 + cluster_rows), dtype=torch.int32, device=token_indices.device
+            )
         # Buffer.dispatch performs a cooperative metadata-notification kernel
         # before enqueueing the data-dispatch producer. A persistent collector
         # launched before that cooperative kernel can prevent its admission and
@@ -255,6 +276,7 @@ def run_dispatch(
                 f"unresolved_sample={samples}"
             ) from exc
         collector_ok, collector_counts = check_collector_output(recv_token_indices, collector_state)
+        collector_ok &= collector_counts == num_recv_tokens_per_expert
 
     if torch.is_tensor(num_recv_tokens_per_expert):
         tokens_per_expert = num_recv_tokens_per_expert.detach().cpu().to(torch.int64).tolist()
@@ -271,6 +293,7 @@ def run_dispatch(
         "collector_ok": collector_ok,
         "collector_counts": collector_counts,
         "gather_ready_rows": int(collector_state.gather_ready_rows.item()) if collector_state else None,
+        "gather_table_rows": collector_state.gather_table.shape[0] if collector_state else None,
     }
     return float(start.elapsed_time(end)), meta
 
@@ -374,7 +397,8 @@ def main() -> int:
             f"recv_topk_indices={last_meta['recv_topk_indices_shape']} "
             f"tokens_per_local_expert={last_meta['tokens_per_local_expert']} "
             f"collector_counts={last_meta['collector_counts']} "
-            f"gather_ready_rows={last_meta['gather_ready_rows']} sanity_ok={local_ok}"
+            f"gather_ready_rows={last_meta['gather_ready_rows']} "
+            f"gather_table_rows={last_meta['gather_table_rows']} sanity_ok={local_ok}"
         ),
     )
     if args.print_timing:

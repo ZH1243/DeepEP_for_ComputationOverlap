@@ -52,15 +52,25 @@ class CollectorWrapperTest(unittest.TestCase):
                                          for r in range(1103)], dtype=dtype)
                     topk = host.cuda()
                     state = allocate_state(1, len(host), gather_cluster_rows=c,
-                                           gather_num_n_groups=groups, gather_group_size=4)
+                                           gather_num_n_groups=groups, gather_group_size=4,
+                                           gather_capacity_rows=0)
+                    self.assertEqual(state.gather_table.numel(), 0)
+                    expected_counts = [(host == e).any(dim=1).sum().item() for e in range(8)]
+                    exact_rows = sum((n + c - 1) // c for n in expected_counts) * groups
                     state.range_begin.zero_()
                     state.range_end.fill_(len(host))
                     state.ready_end.copy_(state.range_end)
                     state.initialized.record()
-                    launch(topk, state).wait()
+                    stream = torch.cuda.Stream()
+                    with torch.cuda.stream(stream):
+                        state.gather_table = torch.empty((exact_rows, 4 + c),
+                                                         dtype=torch.int32, device=topk.device)
+                    launch(topk, state, stream=stream).wait()
                     counts = state.ready_count.cpu().tolist()
+                    self.assertEqual(counts, expected_counts)
                     self.assertEqual(state.written_count.cpu().tolist(), counts)
                     q = state.gather_ready_rows.item()
+                    self.assertEqual(q, state.gather_table.shape[0])
                     self.assertEqual(q, sum((n + c - 1) // c for n in counts) * groups)
                     table = state.gather_table[:q].cpu().tolist()
                     gathered = [[] for _ in range(8)]

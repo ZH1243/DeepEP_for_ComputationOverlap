@@ -100,6 +100,7 @@ def allocate_state(
     gather_cluster_rows: int = 512,
     gather_num_n_groups: int = 2,
     gather_group_size: int = 8,
+    gather_capacity_rows: Optional[int] = None,
 ) -> CollectorState:
     """Allocate fresh state; producers must wait for state.initialized.
 
@@ -110,6 +111,9 @@ def allocate_state(
     only its gather_ready_rows prefix is committed (see README.md).
     Rows contain [expert, N base, output start, output end, direct X indices...].
     Output ranges are unpadded and packed in bundle publication order.
+    gather_capacity_rows overrides the worst-case table allocation. Use zero
+    to defer table storage until notification supplies exact receive counts;
+    replace state.gather_table before launch, on the collector stream.
     """
     if capacity is None:
         capacity = num_rows
@@ -123,7 +127,12 @@ def allocate_state(
                         ("gather_group_size", gather_group_size)):
         if not isinstance(value, int) or not 1 <= value <= 2**31 - 5:
             raise ValueError(f"{name} must be a positive int32 integer")
-    table_rows = 8 * ((capacity + gather_cluster_rows - 1) // gather_cluster_rows) * gather_num_n_groups
+    if gather_capacity_rows is not None and (
+        not isinstance(gather_capacity_rows, int) or not 0 <= gather_capacity_rows <= 2**31 - 1
+    ):
+        raise ValueError("gather_capacity_rows must be an integer in [0, INT_MAX]")
+    table_rows = (8 * ((capacity + gather_cluster_rows - 1) // gather_cluster_rows) * gather_num_n_groups
+                  if gather_capacity_rows is None else gather_capacity_rows)
     if max(table_rows, gather_num_n_groups * gather_group_size) > 2**31 - 1:
         raise ValueError("gather table row count and N geometry must fit in int32")
     device = torch.device("cuda" if device is None else device)

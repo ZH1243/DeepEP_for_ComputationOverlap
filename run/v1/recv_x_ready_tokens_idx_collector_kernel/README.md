@@ -59,22 +59,36 @@ an expert-major down-projection needs a reorder or a different offset policy.
 The table contains direct recv_x row indices, not pointers, and does
 not copy recv_x. Keep recv_x alive through any future consumer.
 
-Allocation uses `Q_capacity = 8 * ceil(capacity / C) * num_n_groups` without a
-host count read or dispatch completion wait. Only
+By default, `allocate_state` uses
+`Q_capacity = 8 * ceil(capacity / C) * num_n_groups`. Its optional
+`gather_capacity_rows` argument overrides that capacity. Only
 `gather_table[:gather_ready_rows]` is valid. On successful completion,
 `written_count == ready_count` and final Q is
 `sum(ceil(ready_count[e] / C)) * num_n_groups`.
 **QuACK currently schedules by table.shape[0]**, so do not pass the entire
-worst-case allocation to a live GEMM: it would wait on unused rows. Future live
-integration needs an exact Q from routing metadata before launching GEMM, or
-scheduler end-of-stream support. A post-completion consumer can use a view of
-the final Q rows. This step deliberately launches only dispatch and collector.
+worst-case allocation to a live GEMM: it would wait on unused rows.
+
+The internode dispatch test now uses `gather_capacity_rows=0` before dispatch,
+so no worst-case table storage is allocated. After `buffer.dispatch()` returns,
+its notification-produced CPU list `num_recv_tokens_per_expert` supplies the
+exact size `Q = sum(ceil(count[e] / C)) * num_n_groups`. The test explicitly uses
+`expert_alignment=1` so these counts are unpadded. It allocates a new int32
+`[Q, 4 + C]` table on the collector stream before launching the collector.
+The existing initialization event still protects the counters and readiness
+state; table storage itself needs no initialization. This adds no explicit
+payload-completion wait or GPU count readback. A CUDA allocator cache miss can
+still introduce allocation latency or synchronization.
+
+This exact table shape can supply a future streaming QuACK consumer's work
+count, with `gather_ready_rows` continuing to protect incremental visibility.
+This test still launches only dispatch and collector.
 
 The existing dispatch command with `--with-collector` now allocates and verifies
 the table too. Optional arguments are `--gather-tile-m`, `--gather-cluster-m`,
 `--gather-tile-n`, `--gather-output-dim`, and `--gather-max-swizzle-size`.
 For a gated projection, pass the full (doubled) GEMM N width as output dim.
-The test prints `gather_ready_rows` after completion and validates every row,
+The test prints both `gather_ready_rows` and `gather_table_rows` after completion,
+requires them to match, compares collected counts to notification counts, and validates every row,
 N-group replica, packed output range, padding slot, and per-expert token sequence.
 
 Raw CUDA callers may append a `GatherTable` to `launch_collector`; the default
