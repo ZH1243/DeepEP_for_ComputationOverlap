@@ -18,7 +18,7 @@ format, with `recv_x` as X. No GEMM is launched. The CTA remains 256 threads.
 
 | Buffer | Type and shape | Meaning |
 |---|---|---|
-| `gather_table` | int32 `[Q_capacity, 2 + C]` | Rows `(expert_id, cid_n_base, recv_x_idx_0, ..., recv_x_idx_{C-1})` |
+| `gather_table` | int32 `[Q_capacity, 4 + C]` | Rows `(expert_id, cid_n_base, output_start, output_end, recv_x_idx_0, ..., recv_x_idx_{C-1})` |
 | `gather_ready_rows` | int32 `[1]`, initially zero | Exclusive committed table-row prefix |
 | `written_count` | int32 `[8]`, initially zero | Actual tokens copied into table bundles per expert; excludes padding and repeated N-group copies |
 
@@ -29,22 +29,34 @@ Set `C = gather_cluster_rows = tile_m * cluster_m`. With
 C=512, group size=8, two N groups, matching the referenced QuACK runner's
 256×256 tile, cluster_m=2, N=4096 defaults. These parameters describe the table;
 the future GEMM must also use a supported matching kernel configuration.
-Width 4 (C=2) is rejected because QuACK treats it as the non-indexed format.
+The four-field header matches QuACK's current `--indexed-gather` single-buffer
+runner. Index slots start at column 4; C=2 now has width 6 and is unambiguous.
 
 After compaction, each expert warp emits all available full C-token batches.
 Only after **all ranges finish** does it flush a remaining partial batch with
 trailing `-1` indices; empty experts emit no rows. Each batch emits consecutive
 N-group rows with bases `0, group_size, ...`. Every N-group row repeats the same
-indices. The CTA assigns contiguous bundle slots, synchronizes all writes, then
+indices and output range. The CTA assigns contiguous bundle slots and packed
+output ranges, synchronizes all writes, then
 thread 0 release-stores `gather_ready_rows`. A GPU consumer must acquire this
 flag before reading the table and payload. `written_count` is per-expert
 progress; it is not the table's global commit signal. Its update can precede
 that global commit. Previously committed table rows are immutable.
 
-Bundle order follows observed readiness, so experts may be interleaved. For
-bundle b, QuACK's output rows are `[b*C, (b+1)*C)`, not fixed expert-contiguous
-segments. A future output/reference or down-projection path must honor that
-ordering. The table contains direct recv_x row indices, not pointers, and does
+Bundle order follows observed readiness, so experts may be interleaved. Each
+bundle explicitly addresses `[output_start, output_end)`, whose length is its
+actual token count. The next bundle starts at the previous bundle's output end;
+N-group replicas share the same range. Partial bundles pad only their index
+slots with `-1`, never the output. Final output has `sum(ready_count)` rows.
+For example, consecutive bundles with 3 and 2 tokens address `[0, 3)` and
+`[3, 5)`, regardless of C or the number of N groups.
+
+QuACK's Python/CPU-proxy example packs output in expert-major order because it
+knows final counts beforehand. This streaming producer instead packs in bundle
+publication order, which the indexed GEMM supports via the explicit ranges.
+A future output/reference or down-projection path must honor this ordering;
+an expert-major down-projection needs a reorder or a different offset policy.
+The table contains direct recv_x row indices, not pointers, and does
 not copy recv_x. Keep recv_x alive through any future consumer.
 
 Allocation uses `Q_capacity = 8 * ceil(capacity / C) * num_n_groups` without a
@@ -63,12 +75,14 @@ the table too. Optional arguments are `--gather-tile-m`, `--gather-cluster-m`,
 `--gather-tile-n`, `--gather-output-dim`, and `--gather-max-swizzle-size`.
 For a gated projection, pass the full (doubled) GEMM N width as output dim.
 The test prints `gather_ready_rows` after completion and validates every row,
-N-group replica, padding slot, and per-expert token sequence.
+N-group replica, packed output range, padding slot, and per-expert token sequence.
 
 Raw CUDA callers may append a `GatherTable` to `launch_collector`; the default
 empty struct preserves index-only operation. Table overflow reports status 7
 without publishing any of the failed iteration's bundles. Earlier table
 prefixes remain valid; index counts can be ahead of written counts on failure.
+Packed output offsets exceeding INT_MAX report status 8 with the same publication
+guarantee.
 
 ## Files and operation
 
@@ -284,6 +298,7 @@ of the producer. Join every participating stream before freeing/reusing buffers.
 | 5 | Routing value outside `[-1, 7]` |
 | 6 | No gathering/completion progress before idle timeout |
 | 7 | Gather table capacity exceeded |
+| 8 | Packed gather output range exceeds int32 |
 
 The watchdog is approximate (`clock64`, converted using GPU clock rate).
 `timeout_ms=0` disables it. On an error, previously committed prefixes remain

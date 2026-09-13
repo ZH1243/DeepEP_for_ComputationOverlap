@@ -41,7 +41,10 @@ __global__ __launch_bounds__(kThreads, 1) void collect(
     __shared__ int watchdog_status;
     __shared__ int bundle_count[kExperts];
     __shared__ int bundle_start[kExperts];
+    __shared__ int output_count[kExperts];
+    __shared__ int output_start[kExperts];
     __shared__ int table_rows;
+    __shared__ int output_rows;
 
     for (int r = tid; r < cached_ranges; r += kThreads) {
         cursor[r] = -1;
@@ -49,6 +52,7 @@ __global__ __launch_bounds__(kThreads, 1) void collect(
     }
     if (tid == 0) {
         table_rows = 0;
+        output_rows = 0;
         finished_ranges = 0;
         failure = kRunning;
     }
@@ -200,39 +204,52 @@ __global__ __launch_bounds__(kThreads, 1) void collect(
             const bool final = finished_ranges == num_ranges;
             const int batches = pending / gather.cluster_rows +
                 (final && pending % gather.cluster_rows != 0);
-            if (lane == 0)
+            if (lane == 0) {
                 bundle_count[warp] = batches;
+                output_count[warp] = final ? pending : pending - pending % gather.cluster_rows;
+            }
             __syncthreads();
             if (tid == 0) {
                 int64_t next = table_rows;
+                int64_t next_output = output_rows;
                 for (int e = 0; e < kExperts; ++e) {
                     bundle_start[e] = static_cast<int>(next);
+                    output_start[e] = static_cast<int>(next_output);
                     next += static_cast<int64_t>(bundle_count[e]) * gather.num_n_groups;
+                    next_output += output_count[e];
                 }
                 if (next > gather.capacity_rows)
                     failure = kTableCapacityExceeded;
-                else
+                else if (next_output > INT32_MAX)
+                    failure = kOutputRangeExceeded;
+                else {
                     table_rows = static_cast<int>(next);
+                    output_rows = static_cast<int>(next_output);
+                }
             }
             __syncthreads();
             if (failure != kRunning) {
                 terminal = failure;
                 break;
             }
+            int output = output_start[warp];
             for (int b = 0; b < batches; ++b) {
                 const int take = min(expert_count - written_count, gather.cluster_rows);
                 for (int n = 0; n < gather.num_n_groups; ++n) {
                     const int row = bundle_start[warp] + b * gather.num_n_groups + n;
-                    int* entry = gather.table + static_cast<int64_t>(row) * (2 + gather.cluster_rows);
+                    int* entry = gather.table + static_cast<int64_t>(row) * (4 + gather.cluster_rows);
                     if (lane == 0) {
                         entry[0] = warp;
                         entry[1] = n * gather.group_size;
+                        entry[2] = output;
+                        entry[3] = output + take;
                     }
                     for (int i = lane; i < gather.cluster_rows; i += 32)
-                        entry[2 + i] = i < take
+                        entry[4 + i] = i < take
                             ? idx_list[static_cast<int64_t>(warp) * capacity + written_count + i] : -1;
                 }
                 written_count += take;
+                output += take;
             }
             __syncwarp(full);
             if (lane == 0 && batches != 0)
@@ -322,8 +339,8 @@ cudaError_t launch_collector(
     if (gather.ready_rows != nullptr &&
         (gather.written_count == nullptr || gather.capacity_rows < 0 ||
          (gather.capacity_rows > 0 && gather.table == nullptr) ||
-         gather.cluster_rows < 1 || gather.cluster_rows > INT32_MAX - 2 ||
-         gather.cluster_rows == 2 || gather.num_n_groups < 1 || gather.group_size < 1 ||
+         gather.cluster_rows < 1 || gather.cluster_rows > INT32_MAX - 4 ||
+         gather.num_n_groups < 1 || gather.group_size < 1 ||
          static_cast<int64_t>(gather.num_n_groups) * gather.group_size > INT32_MAX))
         return cudaErrorInvalidValue;
     if (topk_is_int64) {

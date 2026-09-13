@@ -98,7 +98,7 @@ def check_collector_output(
 
 def check_gather_output(state, counts: list[int]) -> bool:
     """Compare every bundle against the committed expert lists after completion."""
-    c = state.gather_table.shape[1] - 2
+    c = state.gather_table.shape[1] - 4
     groups = state.gather_num_n_groups
     q = int(state.gather_ready_rows.item())
     expected_q = sum((count + c - 1) // c for count in counts) * groups
@@ -109,6 +109,7 @@ def check_gather_output(state, counts: list[int]) -> bool:
     table = state.gather_table[:q].cpu().tolist()
     indices = [state.indices[e, :counts[e]].cpu().tolist() for e in range(8)]
     cursors = [0] * 8
+    output = 0
     for first in range(0, q, groups):
         expert = table[first][0]
         if not 0 <= expert < 8:
@@ -119,10 +120,13 @@ def check_gather_output(state, counts: list[int]) -> bool:
             return False
         expected = indices[expert][start:start + take] + [-1] * (c - take)
         for n in range(groups):
-            if table[first + n] != [expert, n * state.gather_group_size, *expected]:
+            if table[first + n] != [
+                expert, n * state.gather_group_size, output, output + take, *expected
+            ]:
                 return False
         cursors[expert] += take
-    return cursors == counts
+        output += take
+    return cursors == counts and output == sum(counts)
 
 
 @torch.no_grad()

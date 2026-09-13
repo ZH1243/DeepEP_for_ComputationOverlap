@@ -44,7 +44,7 @@ void launch(
                 status.dim() == 1 && status.numel() == 1, "invalid count/status shape");
 
     TORCH_CHECK(table.dim() == 2 && table.size(0) <= max_int &&
-                table.size(1) >= 3 && table.size(1) <= max_int && table.size(1) != 4,
+                table.size(1) >= 5 && table.size(1) <= max_int,
                 "invalid indexed gather table shape");
     TORCH_CHECK(table_ready.dim() == 1 && table_ready.numel() == 1 &&
                 written.sizes() == counts.sizes(), "invalid gather counter shape");
@@ -53,7 +53,7 @@ void launch(
                 "invalid N-group geometry");
     recv_x_ready::GatherTable gather{
         table.data_ptr<int>(), table_ready.data_ptr<int>(), written.data_ptr<int>(),
-        static_cast<int>(table.size(0)), static_cast<int>(table.size(1) - 2),
+        static_cast<int>(table.size(0)), static_cast<int>(table.size(1) - 4),
         num_n_groups, group_size};
     const c10::cuda::CUDAGuard guard(topk.device());
     C10_CUDA_CHECK(recv_x_ready::launch_collector(

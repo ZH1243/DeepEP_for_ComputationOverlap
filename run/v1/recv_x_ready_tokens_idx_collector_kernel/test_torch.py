@@ -46,7 +46,7 @@ class CollectorWrapperTest(unittest.TestCase):
 
     def test_gather_bundles(self):
         for dtype in (torch.int32, torch.int64):
-            for c, groups in ((3, 1), (17, 3), (512, 2)):
+            for c, groups in ((1, 1), (2, 2), (3, 1), (17, 3), (512, 2)):
                 with self.subTest(dtype=dtype, cluster_rows=c, groups=groups):
                     host = torch.tensor([[r % 7, r % 7, (r + 2) % 7]
                                          for r in range(1103)], dtype=dtype)
@@ -64,14 +64,19 @@ class CollectorWrapperTest(unittest.TestCase):
                     self.assertEqual(q, sum((n + c - 1) // c for n in counts) * groups)
                     table = state.gather_table[:q].cpu().tolist()
                     gathered = [[] for _ in range(8)]
+                    output = 0
                     for r in range(0, q, groups):
-                        expert, _, *indices = table[r]
+                        expert, _, start, end, *indices = table[r]
                         valid = [i for i in indices if i >= 0]
                         self.assertGreater(len(valid), 0)
+                        self.assertEqual(start, output)
+                        self.assertEqual(end, start + len(valid))
                         self.assertEqual(indices, valid + [-1] * (c - len(valid)))
                         for n in range(groups):
-                            self.assertEqual(table[r + n], [expert, n * 4, *indices])
+                            self.assertEqual(table[r + n], [expert, n * 4, start, end, *indices])
                         gathered[expert].extend(valid)
+                        output = end
+                    self.assertEqual(output, sum(counts))
                     for expert in range(8):
                         expected = torch.nonzero((host == expert).any(dim=1)).flatten().tolist()
                         self.assertEqual(sorted(gathered[expert]), expected)

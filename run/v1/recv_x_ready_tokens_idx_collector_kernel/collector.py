@@ -20,6 +20,7 @@ _STATUS = {
     5: "routing entry is outside [-1, 7]",
     6: "collector idle timeout: producer stopped publishing or did not run",
     7: "gather table capacity exceeded",
+    8: "packed gather output range exceeds int32",
 }
 
 
@@ -107,6 +108,8 @@ def allocate_state(
     Gather geometry defaults to QuACK tile_m=tile_n=256, cluster_m=2, N=4096,
     max_swizzle_size=8. The table allocation is a capacity, not a final work count;
     only its gather_ready_rows prefix is committed (see README.md).
+    Rows contain [expert, N base, output start, output end, direct X indices...].
+    Output ranges are unpadded and packed in bundle publication order.
     """
     if capacity is None:
         capacity = num_rows
@@ -118,10 +121,8 @@ def allocate_state(
     for name, value in (("gather_cluster_rows", gather_cluster_rows),
                         ("gather_num_n_groups", gather_num_n_groups),
                         ("gather_group_size", gather_group_size)):
-        if not isinstance(value, int) or not 1 <= value <= 2**31 - 3:
+        if not isinstance(value, int) or not 1 <= value <= 2**31 - 5:
             raise ValueError(f"{name} must be a positive int32 integer")
-    if gather_cluster_rows == 2:
-        raise ValueError("cluster_rows=2 produces width 4, which QuACK interprets as non-indexed")
     table_rows = 8 * ((capacity + gather_cluster_rows - 1) // gather_cluster_rows) * gather_num_n_groups
     if max(table_rows, gather_num_n_groups * gather_group_size) > 2**31 - 1:
         raise ValueError("gather table row count and N geometry must fit in int32")
@@ -142,7 +143,7 @@ def allocate_state(
             ready_count=torch.zeros(8, **options),
             consumed_end=torch.full((num_ranges,), -1, **options),
             status=torch.zeros(1, **options),
-            gather_table=torch.empty((table_rows, 2 + gather_cluster_rows), **options),
+            gather_table=torch.empty((table_rows, 4 + gather_cluster_rows), **options),
             gather_ready_rows=torch.zeros(1, **options),
             written_count=torch.zeros(8, **options),
             gather_num_n_groups=gather_num_n_groups,

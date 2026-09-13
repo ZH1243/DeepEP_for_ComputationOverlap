@@ -109,6 +109,7 @@ __global__ void observer(
     const int lane = threadIdx.x;
     int seen = 0;
     int seen_table = 0;
+    int output_end = 0;
     const auto started = clock64();
     while (true) {
         int terminal = lane == 0 ? recv_x_ready::load_acquire(status) : 0;
@@ -143,14 +144,29 @@ __global__ void observer(
                 return;
             }
             for (int r = seen_table; r < q; ++r) {
-                const int* entry = gather.table + r * (2 + gather.cluster_rows);
+                const int* entry = gather.table + r * (4 + gather.cluster_rows);
                 const int expert = entry[0];
                 if (expert < 0 || expert >= 8 ||
                     entry[1] != (r % gather.num_n_groups) * gather.group_size)
                     atomicExch(error, 7);
+                const int valid = entry[3] - entry[2];
+                if (valid < 1 || valid > gather.cluster_rows)
+                    atomicExch(error, 10);
+                if (r % gather.num_n_groups == 0) {
+                    if (entry[2] != output_end)
+                        atomicExch(error, 10);
+                    output_end = entry[3];
+                } else {
+                    const int* first = entry - (r % gather.num_n_groups) * (4 + gather.cluster_rows);
+                    for (int i = 0; i < 4 + gather.cluster_rows; ++i)
+                        if (i != 1 && entry[i] != first[i])
+                            atomicExch(error, 10);
+                }
                 bool padding = false;
                 for (int i = 0; i < gather.cluster_rows; ++i) {
-                    const int row = entry[2 + i];
+                    const int row = entry[4 + i];
+                    if ((i < valid && row < 0) || (i >= valid && row != -1))
+                        atomicExch(error, 10);
                     if (row == -1) {
                         padding = true;
                     } else if (padding || row < 0 || row >= rows) {
@@ -195,7 +211,7 @@ void check_incremental(int num_topk, unsigned long long timeout) {
     DeviceArray<int> indices(8 * rows), counts(8), consumed(ranges), status(1), observed(1), error(1);
     constexpr int cluster_rows = 17, groups = 3, group_size = 2;
     const int table_capacity = 8 * ((rows + cluster_rows - 1) / cluster_rows) * groups;
-    DeviceArray<int> table(table_capacity * (2 + cluster_rows)), table_ready(1), written(8);
+    DeviceArray<int> table(table_capacity * (4 + cluster_rows)), table_ready(1), written(8);
     table.fill_bytes(0x7f);
     table_ready.fill_bytes(0);
     written.fill_bytes(0);
@@ -245,22 +261,30 @@ void check_incremental(int num_topk, unsigned long long timeout) {
         expected_q += ((count + cluster_rows - 1) / cluster_rows) * groups;
     CHECK(q == expected_q);
     std::vector<int> cursor(8, 0);
+    int output = 0;
     for (int r = 0; r < q; r += groups) {
-        const int expert = actual_table[r * (2 + cluster_rows)];
+        const int expert = actual_table[r * (4 + cluster_rows)];
         CHECK(expert >= 0 && expert < 8);
         const int take = std::min(cluster_rows, actual_counts[expert] - cursor[expert]);
         CHECK(take > 0);
         for (int n = 0; n < groups; ++n) {
-            const int base = (r + n) * (2 + cluster_rows);
+            const int base = (r + n) * (4 + cluster_rows);
             CHECK(actual_table[base] == expert);
             CHECK(actual_table[base + 1] == n * group_size);
+            CHECK(actual_table[base + 2] == output);
+            CHECK(actual_table[base + 3] == output + take);
             for (int i = 0; i < cluster_rows; ++i)
-                CHECK(actual_table[base + 2 + i] == (i < take
+                CHECK(actual_table[base + 4 + i] == (i < take
                     ? actual_indices[expert * rows + cursor[expert] + i] : -1));
         }
         cursor[expert] += take;
+        output += take;
     }
     CHECK(cursor == actual_counts);
+    int expected_output = 0;
+    for (int count : actual_counts)
+        expected_output += count;
+    CHECK(output == expected_output);
     const auto actual_consumed = consumed.get();
     for (int r = 0; r < ranges; ++r)
         CHECK(actual_consumed[r] == bounds[r + 1]);

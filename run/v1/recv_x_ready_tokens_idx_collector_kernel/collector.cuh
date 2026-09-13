@@ -19,6 +19,7 @@ enum Status : int {
     kInvalidExpert = 5,
     kIdleTimeout = 6,
     kTableCapacityExceeded = 7,
+    kOutputRangeExceeded = 8,
 };
 
 // All buffers are on the same GPU, in the same memory synchronization domain.
@@ -59,7 +60,9 @@ __device__ __forceinline__ void publish_ready(
 
 // Optional single-buffer QuACK indexed table. Zero counters before launch.
 // Each bundle has num_n_groups consecutive rows [expert, n * group_size,
-// cluster_rows direct recv_x indices], with trailing -1 in the final batch.
+// output_start, output_end, cluster_rows direct recv_x indices]. Output ranges
+// are packed in bundle publication order, shared by all N copies, and exclude
+// trailing -1 index padding in the final batch.
 // ready_rows is a GPU release/acquire committed prefix, never a reservation.
 struct GatherTable {
     int* table = nullptr;
